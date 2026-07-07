@@ -226,6 +226,15 @@ export async function initHttp(
   const filterAgents = options.agent ? [options.agent] : undefined;
   await reconcileTeamHooksForConfig(teamConfig, localConfig, { filterAgents });
 
+  // Step 6: also initialize local-agent config so the new hook-dispatch --stdin
+  // path can deliver rules/claudemd (not just skills).
+  const { initLocalAgentHttp } = await import('./local-agent.js');
+  try {
+    await initLocalAgentHttp({ endpoint: url, token: options.token, force: options.force });
+  } catch (e) {
+    log.debug(`Local agent init: ${(e as Error).message}`);
+  }
+
   if (reportingOnly) {
     log.success('teamai initialized (HTTP, reporting-only — /repo not live yet)!');
     log.info('Status reporting is active now; skills/rules will sync automatically once /repo is available.');

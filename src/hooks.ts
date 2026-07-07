@@ -544,6 +544,7 @@ export async function reconcileHooksToAllTools(
   for (const [tool, paths] of Object.entries(toolPaths)) {
     if (opts.filterAgents && !opts.filterAgents.includes(tool)) continue;
     if (!paths.settings) continue;
+    if (opts.filterAgents && !opts.filterAgents.includes(tool)) continue;
     if (!opts.force) {
       const toolRoot = path.join(baseDir, paths.settings.split('/')[0]);
       if (!await pathExists(toolRoot)) continue;
