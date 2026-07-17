@@ -166,6 +166,7 @@ The graph stores components, interfaces, configs, and cross-repo import edges. `
 | `teamai ci extract-mr --url <url>` | CI: extract knowledge from MR, post comments, write after merge |
 | `teamai members` | List team members |
 | `teamai roles` | Manage team roles and namespaces |
+| `teamai skill exclude add/remove/list` | Manage skills excluded from local sync ([usage guide](docs/usage-guide.md#排除个人不需要的-skill)) |
 | `teamai source` | Manage cross-team skill subscriptions |
 | `teamai remove <type> <name>` | Remove a resource and open MR |
 | `teamai digest` | Generate weekly team usage digest |
