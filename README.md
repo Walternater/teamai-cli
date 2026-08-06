@@ -127,10 +127,14 @@ Beyond distributing the Harness, TeamAI organizes accumulated team experience an
 When a session ends, the Stop hook scores it by **friction** — signals that the session hit something worth remembering: you interrupted or corrected the AI, denied a tool call, or the AI had to retry failing tools. A long-but-routine session (lots of tool calls, no friction) does not trigger; a session where you actually fought a problem does. If the score is high enough, the AI suggests:
 
 ```
-建议运行 /teamai-share-learnings 总结本次 session 的经验并分享给团队。
+[teamai] This session may contain a problem worth documenting: you interrupted the AI twice, the AI retried failing tools 8 times.
+
+Task: Fix duplicate project-level Hook injection
+
+Consider running /teamai-share-learnings to summarize what you learned and share it with your team.
 ```
 
-The `/teamai-share-learnings` skill summarizes the session and pushes a learning document directly to the team repo. Each session is prompted at most once.
+The hint names the non-zero friction signals that triggered it and, when available, includes a redacted, single-line summary of the first task. The `/teamai-share-learnings` skill summarizes the session and pushes a learning document directly to the team repo. Each session is prompted at most once.
 
 ### Team Knowledge Recall
 
