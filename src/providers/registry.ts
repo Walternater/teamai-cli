@@ -2,6 +2,7 @@ import type { GitProvider } from './types.js';
 import { TGitProvider } from './tgit/index.js';
 import { GitHubProvider } from './github/index.js';
 import { CNBProvider } from './cnb/index.js';
+import { GitLabProvider } from './gitlab/index.js';
 import { getCurrentPackageName } from '../package-info.js';
 
 // ─── Provider Detection ──────────────────────────────────
@@ -30,10 +31,20 @@ const HOST_MAP: Record<string, string> = {
   'github.com': 'github',
   'git.woa.com': 'tgit',
   'cnb.cool': 'cnb',
+  'gitlab.com': 'gitlab',
 };
 
+// A self-hosted GitLab host (TEAMAI_GITLAB_HOST, e.g. gitlab.mycompany.com)
+// also routes to the gitlab provider - added at module load so detectProvider
+// resolves `teamai init https://gitlab.mycompany.com/group/repo` correctly.
+const customGitlabHost = process.env.TEAMAI_GITLAB_HOST?.trim()
+  .replace(/^https?:\/\//, '')
+  .replace(/\/+$/, '')
+  .toLowerCase();
+if (customGitlabHost) HOST_MAP[customGitlabHost] = 'gitlab';
+
 /** Providers we are willing to accept as a default override. */
-const KNOWN_PROVIDERS = new Set(['github', 'tgit', 'cnb']);
+const KNOWN_PROVIDERS = new Set(['github', 'tgit', 'cnb', 'gitlab']);
 
 /**
  * Decide the fallback provider used when the input URL host is unknown or
@@ -95,6 +106,7 @@ const PROVIDERS: Record<string, () => GitProvider> = {
   tgit: () => new TGitProvider(),
   github: () => new GitHubProvider(),
   cnb: () => new CNBProvider(),
+  gitlab: () => new GitLabProvider(),
 };
 
 /**

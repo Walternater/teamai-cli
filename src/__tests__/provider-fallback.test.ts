@@ -83,7 +83,7 @@ describe('getDefaultProvider (fallback)', () => {
 
   it('ignores unknown TEAMAI_DEFAULT_PROVIDER values', () => {
     setPackageName('teamai-cli');
-    process.env.TEAMAI_DEFAULT_PROVIDER = 'gitlab';
+    process.env.TEAMAI_DEFAULT_PROVIDER = 'unknown-provider';
     // Falls through to package-name-based default (public npm → github).
     expect(getDefaultProvider()).toBe('github');
   });
@@ -114,7 +114,7 @@ describe('detectProvider with package-name fallback', () => {
 
   it('unknown host → tgit when installed from internal tnpm', () => {
     setPackageName('@tencent/teamai-cli');
-    expect(detectProvider('https://gitlab.com/org/repo')).toBe('tgit');
+    expect(detectProvider('https://git.example.com/org/repo')).toBe('tgit');
   });
 
   it('explicit github.com URL still resolves to github on tnpm build', () => {

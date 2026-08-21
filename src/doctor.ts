@@ -100,6 +100,16 @@ export async function doctor(options: GlobalOptions): Promise<void> {
         fix: 'Run `gh auth login` to authenticate',
       },
     );
+  } else if (providerName === 'gitlab') {
+    // Dynamic import to avoid loading gitlab code when not needed
+    const { gitlabIsAuthenticated } = await import('./providers/gitlab/index.js');
+    checks.push(
+      {
+        name: 'GitLab token is configured',
+        check: async () => gitlabIsAuthenticated(),
+        fix: 'Run `teamai init` to enter a personal access token, or export GITLAB_TOKEN',
+      },
+    );
   }
 
   checks.push(
