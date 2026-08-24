@@ -9,6 +9,7 @@ import { getProvider, detectProvider, RepoNotFoundError } from './providers/inde
 import { ensureDir, writeFile, pathExists, expandHome, readFileSafe, remove } from './utils/fs.js';
 import { log, spinner } from './utils/logger.js';
 import { TEAMAI_HOME, REPORTS_BRANCH, type GlobalOptions, type LocalConfig, type Scope, getTeamaiHome, getConfigPath } from './types.js';
+import { getUserHome } from './utils/home.js';
 import { describeRoles, loadRolesManifest } from './roles.js';
 import { askQuestion, askConfirmation, askSelection, closePrompt } from './utils/prompt.js';
 import {
@@ -198,7 +199,7 @@ function printScopeSummary(
   explicit: boolean,
 ): void {
   const configPath = getConfigPath(scope, projectRoot);
-  const baseDir = scope === 'project' ? (projectRoot ?? process.cwd()) : (process.env.HOME ?? '~');
+  const baseDir = scope === 'project' ? (projectRoot ?? process.cwd()) : getUserHome();
   log.info(`Scope: ${scope}${scope === 'project' ? ` (${projectRoot})` : ''}`);
   log.info(`  config    → ${configPath}`);
   log.info(`  resources → ${baseDir}/.claude/skills, ...`);
@@ -241,7 +242,7 @@ export async function initHttp(
     ({ scope, projectRoot, explicit, fallbackReason } = resolveInitScope(
       options.scope,
       process.cwd(),
-      process.env.HOME ?? '',
+      getUserHome(),
     ));
   } catch (e) {
     log.error((e as Error).message);
@@ -886,7 +887,7 @@ export async function init(options: GlobalOptions & {
     ({ scope, projectRoot, explicit, fallbackReason } = resolveInitScope(
       options.scope,
       process.cwd(),
-      process.env.HOME ?? '',
+      getUserHome(),
     ));
   } catch (e) {
     log.error((e as Error).message);
@@ -964,16 +965,17 @@ export async function init(options: GlobalOptions & {
   // Step 2: Ensure provider tools are installed and authenticate
   await provider.ensureInstalled();
 
-  const authSpin = spinner('Checking authentication...').start();
+  const isGenericGit = provider.name === 'git';
+  const authSpin = spinner(isGenericGit ? 'Checking Git identity...' : 'Checking authentication...').start();
   let username: string;
   try {
     if (provider.isAuthenticated()) {
       username = await provider.authenticate();
-      authSpin.succeed(`Authenticated as ${username}`);
+      authSpin.succeed(isGenericGit ? `Using Git identity ${username}` : `Authenticated as ${username}`);
     } else {
-      authSpin.info('Not logged in — starting authentication');
+      authSpin.info(isGenericGit ? 'Resolving Git identity' : 'Not logged in — starting authentication');
       username = await provider.authenticate();
-      log.success(`Authenticated as ${username}`);
+      log.success(isGenericGit ? `Using Git identity ${username}` : `Authenticated as ${username}`);
     }
   } catch (e) {
     authSpin.fail(`Authentication failed: ${(e as Error).message}`);
@@ -1001,8 +1003,11 @@ export async function init(options: GlobalOptions & {
 
   if (!await pathExists(localPath)) {
     const cloneSpin = spinner('Cloning team repo...').start();
+    const cloneTarget = provider.name === 'git'
+      ? repoInfo.httpsUrl
+      : `${repoInfo.owner}/${repoInfo.repo}`;
     try {
-      provider.cloneRepo(`${repoInfo.owner}/${repoInfo.repo}`, localPath);
+      provider.cloneRepo(cloneTarget, localPath);
       cloneSpin.succeed('Team repo cloned');
     } catch (e) {
       if (e instanceof RepoNotFoundError) {
@@ -1032,7 +1037,7 @@ export async function init(options: GlobalOptions & {
         // Retry clone after creation
         const retryCloneSpin = spinner('Cloning newly created repo...').start();
         try {
-          provider.cloneRepo(`${repoInfo.owner}/${repoInfo.repo}`, localPath);
+          provider.cloneRepo(cloneTarget, localPath);
           retryCloneSpin.succeed('Team repo cloned');
         } catch (ce) {
           retryCloneSpin.fail(`Clone failed: ${(ce as Error).message}`);
