@@ -24,6 +24,7 @@ import {
   getTeamaiHome,
   isRecallEnabled,
   isAgentDisabled,
+  scopedToolPaths,
 } from './types.js';
 import type { CultureFrontmatter } from './types.js';
 import { loadRolesManifest, resolveRoleResourceNamespaces, type ResourceNamespaces } from './roles.js';
@@ -203,7 +204,7 @@ export async function cleanupInactiveNamespaceSkills(
 ): Promise<void> {
   const baseDir = resolveBaseDir(localConfig);
 
-  for (const [tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
+  for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     if (isAgentDisabled(localConfig, tool)) continue;
     if (!toolPath.skills) continue;
     if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir)) continue;
@@ -237,7 +238,7 @@ async function getExistingLocalNames(
 
   if (type === 'skills') {
     // Check the first installed tool's skills directory
-    for (const [_tool, toolPath] of Object.entries(teamConfig.toolPaths)) {
+    for (const [_tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (!toolPath.skills) continue;
       const skillsDir = path.join(baseDir, toolPath.skills);
       if (!await pathExists(skillsDir)) continue;
@@ -392,15 +393,21 @@ async function pullForScope(
       const knowledgeNs = roleContext ? roleContext.activeNamespaces.knowledge : null;
       const roleFiltered = filterRulesByKnowledgeNamespaces(allItems, knowledgeNs);
       const { included: items, skipped } = filterByTags(roleFiltered, tagsConfig, subscribedTags, 'rules');
-      if (items.length > 0) {
-        if (options.dryRun) {
+      if (options.dryRun) {
+        if (items.length > 0) {
           log.info(`[${scopeLabel}] [dry-run] Would sync ${items.length} rule(s)${skipped.length > 0 ? ` (skipped ${skipped.length} by tags)` : ''}`);
-        } else {
-          await rulesHandler.pullAllRules(freshConfig, localConfig, items);
+        }
+      } else {
+        // Always call pullAllRules, even with an empty set: it also cleans up
+        // stale local rule files and deactivates the OpenCode instructions glob
+        // when the team's last rule is removed. Guarding on items.length > 0
+        // would leak those artifacts on the machine after upstream deletion.
+        await rulesHandler.pullAllRules(freshConfig, localConfig, items);
+        if (items.length > 0) {
           log.success(`[${scopeLabel}] Synced ${items.length} rule(s)${skipped.length > 0 ? ` (skipped ${skipped.length} by tags)` : ''}`);
         }
-        totalSynced += items.length;
       }
+      totalSynced += items.length;
       continue;
     }
 
@@ -527,7 +534,7 @@ async function pullForScope(
       const tombstones = await handler.readTombstones(localConfig);
       if (tombstones.size === 0) continue;
 
-      for (const [tool, toolPath] of Object.entries(freshConfig.toolPaths)) {
+      for (const [tool, toolPath] of Object.entries(scopedToolPaths(freshConfig, localConfig))) {
         const dir = toolPath[toolPathField];
         if (!dir) continue;
         if (!await ResourceHandler.isToolInstalled(dir, baseDir)) continue;
@@ -557,7 +564,7 @@ async function pullForScope(
   if (!options.dryRun && desiredSkillNames && knownRepoSkillNames) {
     const baseDir = resolveBaseDir(localConfig);
 
-    for (const [tool, toolPath] of Object.entries(freshConfig.toolPaths)) {
+    for (const [tool, toolPath] of Object.entries(scopedToolPaths(freshConfig, localConfig))) {
       if (isAgentDisabled(localConfig, tool)) continue;
       if (!toolPath.skills) continue;
       if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir)) continue;
@@ -689,7 +696,7 @@ async function pullForScope(
           const compiled = compileCulture(cultureContent);
           if (compiled) {
             const baseDir = resolveBaseDir(localConfig);
-            for (const [tool, toolPath] of Object.entries(freshConfig.toolPaths)) {
+            for (const [tool, toolPath] of Object.entries(scopedToolPaths(freshConfig, localConfig))) {
               if (isAgentDisabled(localConfig, tool)) continue;
               if (!toolPath.claudemd) continue;
               if (toolPath.rules && !await ResourceHandler.isToolInstalled(toolPath.rules, baseDir)) continue;
@@ -720,7 +727,7 @@ async function pullForScope(
         const compiled = compileClaudemd(claudemdContents);
         if (compiled) {
           const baseDir = resolveBaseDir(localConfig);
-          for (const [tool, toolPath] of Object.entries(freshConfig.toolPaths)) {
+          for (const [tool, toolPath] of Object.entries(scopedToolPaths(freshConfig, localConfig))) {
             if (isAgentDisabled(localConfig, tool)) continue;
             if (!toolPath.claudemd) continue;
             if (toolPath.rules && !await ResourceHandler.isToolInstalled(toolPath.rules, baseDir)) continue;
@@ -966,7 +973,7 @@ export async function injectRecallBlockIntoTools(
         const baseDir = resolveBaseDir(localConfig);
         const recallBlock = compileRecallRulesBlock();
         let injected = 0;
-        for (const [tool, toolPath] of Object.entries(config.toolPaths)) {
+        for (const [tool, toolPath] of Object.entries(scopedToolPaths(config, localConfig))) {
             if (isAgentDisabled(localConfig, tool)) continue;
             if (!toolPath.claudemd || !toolPath.agents) continue;
             if (!await ResourceHandler.isToolInstalled(toolPath.agents, baseDir)) continue;
