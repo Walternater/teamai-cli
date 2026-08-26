@@ -53,6 +53,8 @@ interface RemovalPlan {
   hookFiles: Array<{ path: string; tool: string }>;
   /** OpenClaw-style hook dirs (<base>/.<tool>/hooks) holding teamai HOOK.md+handler.ts. */
   openclawHookDirs: Array<{ hooksDir: string; tool: string }>;
+  /** OpenCode teamai plugin files (.opencode/plugin/teamai-*.ts) to delete. */
+  opencodeHookScopes: Array<{ baseDir: string; scope: Scope }>;
   /** CLAUDE.md files with teamai rules blocks. */
   claudeMdFiles: string[];
   /** Skill directories synced from team repo. */
@@ -85,6 +87,7 @@ interface RemovalPlan {
 interface ToolResources {
   hookFiles: Array<{ path: string; tool: string }>;
   openclawHookDirs: Array<{ hooksDir: string; tool: string }>;
+  opencodeHookScopes: Array<{ baseDir: string; scope: Scope }>;
   claudeMdFiles: string[];
   skillDirs: string[];
   ruleFiles: string[];
@@ -95,6 +98,7 @@ function hasToolResources(r: ToolResources): boolean {
   return (
     r.hookFiles.length > 0 ||
     r.openclawHookDirs.length > 0 ||
+    r.opencodeHookScopes.length > 0 ||
     r.claudeMdFiles.length > 0 ||
     r.skillDirs.length > 0 ||
     r.ruleFiles.length > 0 ||
@@ -171,6 +175,23 @@ function isEmptyHooksResidue(parsed: Record<string, unknown> | null): boolean {
   return entries.length > 0 && entries.every((v) => Array.isArray(v) && v.length === 0);
 }
 
+/**
+ * OpenCode plugin locations to sweep on uninstall.
+ *
+ * teamai writes a single plugin into the user dir (`~/.config/opencode/plugin`),
+ * so that one is always checked. A project-scope uninstall additionally checks
+ * `<projectRoot>/.opencode/plugin`, where an earlier layout wrote a second copy
+ * that OpenCode would load alongside the user one.
+ */
+function opencodePluginTargets(baseDir: string, scope: Scope): Array<{ baseDir: string; scope: Scope }> {
+  const home = getUserHome();
+  const targets: Array<{ baseDir: string; scope: Scope }> = [{ baseDir: home, scope: 'user' }];
+  if (scope === 'project' && path.resolve(baseDir) !== path.resolve(home)) {
+    targets.push({ baseDir, scope: 'project' });
+  }
+  return targets;
+}
+
 // ─── Discovery ─────────────────────────────────────────
 
 async function discoverToolResources(
@@ -180,14 +201,32 @@ async function discoverToolResources(
   teamSkillNames: Set<string>,
   teamRuleNames: Set<string>,
   managedHooksPath: string,
+  scope: Scope,
 ): Promise<ToolResources> {
   const res: ToolResources = {
-    hookFiles: [], openclawHookDirs: [], claudeMdFiles: [],
+    hookFiles: [], openclawHookDirs: [], opencodeHookScopes: [], claudeMdFiles: [],
     skillDirs: [], ruleFiles: [], agentFiles: [],
   };
 
   // (a) Hooks — settings.json / hooks.json
-  if (toolPath.settings) {
+  if (tool === 'opencode') {
+    // OpenCode has no settings file; its teamai hooks are plugin .ts files under
+    // <base>/.config/opencode/plugin (where teamai writes them) or
+    // <base>/.opencode/plugin (a project-scope copy from an earlier layout).
+    const { resolveOpencodePluginDir, OPENCODE_HOOK_FILE } = await import('./opencode-hooks.js');
+    for (const target of opencodePluginTargets(baseDir, scope)) {
+      const pluginDir = resolveOpencodePluginDir(target.baseDir, target.scope);
+      if (await pathExists(path.join(pluginDir, OPENCODE_HOOK_FILE))) {
+        res.opencodeHookScopes.push(target);
+      } else if (await pathExists(pluginDir)) {
+        // Agent-hook plugins (teamai-agent-*.ts) may exist without the main hook file.
+        const files = await listFilesRecursive(pluginDir);
+        if (files.some((f) => path.basename(f).startsWith('teamai-agent-'))) {
+          res.opencodeHookScopes.push(target);
+        }
+      }
+    }
+  } else if (toolPath.settings) {
     const settingsPath = path.join(baseDir, toolPath.settings);
     if (await pathExists(settingsPath)
       && (await hasTeamaiHooks(settingsPath, tool, managedHooksPath)
@@ -305,7 +344,7 @@ async function buildRemovalPlan(
   for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     perTool.set(
       tool,
-      await discoverToolResources(tool, toolPath, baseDir, teamSkillNames, teamRuleNames, managedHooksPath),
+      await discoverToolResources(tool, toolPath, baseDir, teamSkillNames, teamRuleNames, managedHooksPath, localConfig.scope),
     );
   }
 
@@ -321,7 +360,7 @@ async function buildRemovalPlan(
       .some(([t, r]) => t !== agentFilter && hasToolResources(r));
     // Remove shared resources only when the target itself has resources AND is
     // the last tool using teamai. Targeting a tool with no teamai resources is a
-    // no-op for shared resources (plan will be empty → "没有需要卸载的内容").
+    // no-op for shared resources (plan will be empty → "Nothing to uninstall").
     includeShared = targetHasResources && !othersHaveResources;
   } else {
     toolsToMerge = [...perTool.keys()];
@@ -331,6 +370,7 @@ async function buildRemovalPlan(
   const plan: RemovalPlan = {
     hookFiles: [],
     openclawHookDirs: [],
+    opencodeHookScopes: [],
     claudeMdFiles: [],
     skillDirs: [],
     ruleFiles: [],
@@ -352,6 +392,7 @@ async function buildRemovalPlan(
     if (!res) continue;
     plan.hookFiles.push(...res.hookFiles);
     plan.openclawHookDirs.push(...res.openclawHookDirs);
+    plan.opencodeHookScopes.push(...res.opencodeHookScopes);
     plan.claudeMdFiles.push(...res.claudeMdFiles);
     plan.skillDirs.push(...res.skillDirs);
     plan.ruleFiles.push(...res.ruleFiles);
@@ -408,6 +449,7 @@ function isPlanEmpty(plan: RemovalPlan): boolean {
   return (
     plan.hookFiles.length === 0 &&
     plan.openclawHookDirs.length === 0 &&
+    plan.opencodeHookScopes.length === 0 &&
     plan.claudeMdFiles.length === 0 &&
     plan.skillDirs.length === 0 &&
     plan.ruleFiles.length === 0 &&
@@ -420,20 +462,19 @@ function isPlanEmpty(plan: RemovalPlan): boolean {
 }
 
 function printSummary(plan: RemovalPlan, agentFilter?: string): void {
-  const cn = plan.scope === 'project' ? '项目级' : '用户级';
   console.log('');
-  console.log(`⚠  正在卸载 ${plan.scope} scope（${cn}）— ${plan.teamaiHome}`);
+  console.log(`⚠  Uninstalling ${plan.scope} scope — ${plan.teamaiHome}`);
   if (agentFilter) {
     const sharedNote = plan.includeShared
       ? ' (last tool — shared resources removed too)'
       : ' (shared resources kept for remaining tools)';
     console.log(`⚠  Uninstalling tool only: ${agentFilter}${sharedNote}`);
   }
-  console.log('⚠  以下 teamai 资源将被移除:');
+  console.log('⚠  The following teamai resources will be removed:');
   console.log('');
 
   if (plan.hookFiles.length > 0) {
-    console.log(`   Hooks (${plan.hookFiles.length} 个文件):`);
+    console.log(`   Hooks (${plan.hookFiles.length} files):`);
     for (const { path: p } of plan.hookFiles) {
       console.log(`     ${p}`);
     }
@@ -441,15 +482,24 @@ function printSummary(plan: RemovalPlan, agentFilter?: string): void {
   }
 
   if (plan.openclawHookDirs.length > 0) {
-    console.log(`   OpenClaw Hooks (${plan.openclawHookDirs.length} 个目录):`);
+    console.log(`   OpenClaw Hooks (${plan.openclawHookDirs.length} directories):`);
     for (const { hooksDir } of plan.openclawHookDirs) {
       console.log(`     ${path.join(hooksDir, OPENCLAW_HOOK_DIR)}/`);
     }
     console.log('');
   }
 
+  if (plan.opencodeHookScopes.length > 0) {
+    console.log(`   OpenCode Hooks (${plan.opencodeHookScopes.length} plugin dirs):`);
+    for (const { baseDir, scope } of plan.opencodeHookScopes) {
+      const configDir = scope === 'project' ? '.opencode' : path.join('.config', 'opencode');
+      console.log(`     ${path.join(baseDir, configDir, 'plugin')}/teamai-*.ts`);
+    }
+    console.log('');
+  }
+
   if (plan.claudeMdFiles.length > 0) {
-    console.log(`   CLAUDE.md 规则块 (${plan.claudeMdFiles.length} 个文件):`);
+    console.log(`   CLAUDE.md rule blocks (${plan.claudeMdFiles.length} files):`);
     for (const p of plan.claudeMdFiles) {
       console.log(`     ${p}`);
     }
@@ -457,17 +507,17 @@ function printSummary(plan: RemovalPlan, agentFilter?: string): void {
   }
 
   if (plan.skillDirs.length > 0) {
-    console.log(`   Skills (${plan.skillDirs.length} 个目录)`);
+    console.log(`   Skills (${plan.skillDirs.length} directories)`);
     console.log('');
   }
 
   if (plan.ruleFiles.length > 0) {
-    console.log(`   Rules (${plan.ruleFiles.length} 个文件)`);
+    console.log(`   Rules (${plan.ruleFiles.length} files)`);
     console.log('');
   }
 
   if (plan.agentFiles.length > 0) {
-    console.log(`   Agents (${plan.agentFiles.length} 个文件)`);
+    console.log(`   Agents (${plan.agentFiles.length} files)`);
     console.log('');
   }
 
@@ -480,19 +530,19 @@ function printSummary(plan: RemovalPlan, agentFilter?: string): void {
   }
 
   if (plan.shellProfile) {
-    console.log('   Shell profile 环境变量块:');
+    console.log('   Shell profile env block:');
     console.log(`     ${plan.shellProfile}`);
     console.log('');
   }
 
   if (plan.docsDir) {
-    console.log('   Docs 目录:');
+    console.log('   Docs directory:');
     console.log(`     ${plan.docsDir}`);
     console.log('');
   }
 
   if (plan.teamaiHomeExists) {
-    console.log('   TeamAI 主目录:');
+    console.log('   TeamAI home directory:');
     console.log(`     ${plan.teamaiHome}/`);
     console.log('');
   }
@@ -520,7 +570,7 @@ async function executeRemoval(plan: RemovalPlan): Promise<void> {
     try {
       await reconcileHooks(settingsPath, tool, [], { removeAll: true, manifestPath: plan.managedHooksPath });
     } catch (e) {
-      log.warn(`移除 hooks 失败 ${settingsPath}: ${(e as Error).message}`);
+      log.warn(`Failed to remove hooks from ${settingsPath}: ${(e as Error).message}`);
     }
   }
 
@@ -529,7 +579,25 @@ async function executeRemoval(plan: RemovalPlan): Promise<void> {
     try {
       await removeOpenClawHooks(hooksDir);
     } catch (e) {
-      log.warn(`移除 OpenClaw hook 失败 ${hooksDir}: ${(e as Error).message}`);
+      log.warn(`Failed to remove OpenClaw hook from ${hooksDir}: ${(e as Error).message}`);
+    }
+  }
+
+  // (a2b) Remove OpenCode teamai plugin files (main hook + any agent-hook plugins).
+  for (const { baseDir, scope } of plan.opencodeHookScopes) {
+    try {
+      const { removeOpencodeHooks, resolveOpencodePluginDir } = await import('./opencode-hooks.js');
+      await removeOpencodeHooks(baseDir, scope);
+      // Sweep leftover teamai-agent-*.ts plugins not tracked in the agent-hook
+      // manifest. listFilesRecursive yields paths relative to pluginDir.
+      const pluginDir = resolveOpencodePluginDir(baseDir, scope);
+      if (await pathExists(pluginDir)) {
+        for (const rel of await listFilesRecursive(pluginDir)) {
+          if (path.basename(rel).startsWith('teamai-agent-')) await remove(path.join(pluginDir, rel));
+        }
+      }
+    } catch (e) {
+      log.warn(`Failed to remove OpenCode hook (${scope} scope): ${(e as Error).message}`);
     }
   }
 
@@ -565,9 +633,9 @@ async function executeRemoval(plan: RemovalPlan): Promise<void> {
       } else {
         await writeFile(claudeMdPath, content + '\n');
       }
-      log.success(`清理 CLAUDE.md: ${claudeMdPath}`);
+      log.success(`Cleaned CLAUDE.md: ${claudeMdPath}`);
     } catch (e) {
-      log.warn(`清理 CLAUDE.md 失败 ${claudeMdPath}: ${(e as Error).message}`);
+      log.warn(`Failed to clean CLAUDE.md ${claudeMdPath}: ${(e as Error).message}`);
     }
   }
 
@@ -576,11 +644,11 @@ async function executeRemoval(plan: RemovalPlan): Promise<void> {
     try {
       await remove(skillDir);
     } catch (e) {
-      log.warn(`移除 skill 失败 ${skillDir}: ${(e as Error).message}`);
+      log.warn(`Failed to remove skill ${skillDir}: ${(e as Error).message}`);
     }
   }
   if (plan.skillDirs.length > 0) {
-    log.success(`移除了 ${plan.skillDirs.length} 个 skill 目录`);
+    log.success(`Removed ${plan.skillDirs.length} skill directories`);
   }
 
   // (d) Remove synced rules
@@ -588,11 +656,11 @@ async function executeRemoval(plan: RemovalPlan): Promise<void> {
     try {
       await remove(ruleFile);
     } catch (e) {
-      log.warn(`移除 rule 失败 ${ruleFile}: ${(e as Error).message}`);
+      log.warn(`Failed to remove rule ${ruleFile}: ${(e as Error).message}`);
     }
   }
   if (plan.ruleFiles.length > 0) {
-    log.success(`移除了 ${plan.ruleFiles.length} 个 rule 文件`);
+    log.success(`Removed ${plan.ruleFiles.length} rule files`);
   }
 
   // (d2) Remove built-in agent files (e.g. teamai-recall)
@@ -600,11 +668,11 @@ async function executeRemoval(plan: RemovalPlan): Promise<void> {
     try {
       await remove(agentFile);
     } catch (e) {
-      log.warn(`移除 agent 失败 ${agentFile}: ${(e as Error).message}`);
+      log.warn(`Failed to remove agent ${agentFile}: ${(e as Error).message}`);
     }
   }
   if (plan.agentFiles.length > 0) {
-    log.success(`移除了 ${plan.agentFiles.length} 个 agent 文件`);
+    log.success(`Removed ${plan.agentFiles.length} agent files`);
   }
 
   // (e) Clean shell profile env block
@@ -618,11 +686,11 @@ async function executeRemoval(plan: RemovalPlan): Promise<void> {
           const before = content.substring(0, startIdx).replace(/\n+$/, '\n');
           const after = content.substring(endIdx + TEAMAI_ENV_END.length).replace(/^\n+/, '\n');
           await writeFile(plan.shellProfile, before + after);
-          log.success(`清理 shell profile: ${plan.shellProfile}`);
+          log.success(`Cleaned shell profile: ${plan.shellProfile}`);
         }
       }
     } catch (e) {
-      log.warn(`清理 shell profile 失败: ${(e as Error).message}`);
+      log.warn(`Failed to clean shell profile: ${(e as Error).message}`);
     }
   }
 
@@ -630,9 +698,9 @@ async function executeRemoval(plan: RemovalPlan): Promise<void> {
   if (plan.docsDir) {
     try {
       await remove(plan.docsDir);
-      log.success(`移除 docs: ${plan.docsDir}`);
+      log.success(`Removed docs: ${plan.docsDir}`);
     } catch (e) {
-      log.warn(`移除 docs 失败: ${(e as Error).message}`);
+      log.warn(`Failed to remove docs: ${(e as Error).message}`);
     }
   }
 
@@ -642,9 +710,9 @@ async function executeRemoval(plan: RemovalPlan): Promise<void> {
     await teardownPlugins();
     try {
       await remove(plan.teamaiHome);
-      log.success(`移除 ${plan.teamaiHome}/`);
+      log.success(`Removed ${plan.teamaiHome}/`);
     } catch (e) {
-      log.warn(`移除 ${plan.teamaiHome} 失败: ${(e as Error).message}`);
+      log.warn(`Failed to remove ${plan.teamaiHome}: ${(e as Error).message}`);
     }
   }
 
@@ -674,7 +742,7 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
     localConfig = result.localConfig;
     teamConfig = result.teamConfig;
   } catch {
-    log.warn('teamai 配置未找到或无效');
+    log.warn('teamai configuration not found or invalid');
   }
 
   if (localConfig && teamConfig) {
@@ -693,21 +761,21 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
     const plan = await buildRemovalPlan(localConfig, teamConfig, agentKey);
 
     if (isPlanEmpty(plan)) {
-      log.info('没有需要卸载的内容');
+      log.info('Nothing to uninstall');
       return;
     }
 
     printSummary(plan, agentKey);
 
     if (opts.dryRun) {
-      log.info('Dry run — 未做任何更改');
+      log.info('Dry run — no changes made');
       return;
     }
 
     if (!opts.force) {
-      const confirmed = await askConfirmation('确认卸载? [y/N] ');
+      const confirmed = await askConfirmation('Confirm uninstall? [y/N] ');
       if (!confirmed) {
-        log.info('已取消');
+        log.info('Cancelled');
         return;
       }
     }
@@ -754,7 +822,7 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
       }
     }
 
-    log.success('teamai 卸载完成');
+    log.success('teamai uninstalled');
   } else {
     // Minimal uninstall — just try to remove ~/.teamai/
     if (opts.agent) {
@@ -764,25 +832,25 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
     }
     const home = path.join(getUserHome(), '.teamai');
     if (!await pathExists(home)) {
-      log.info('没有需要卸载的内容');
+      log.info('Nothing to uninstall');
       return;
     }
 
     console.log('');
-    console.log('⚠  正在卸载 user scope（用户级，未检测到有效配置，仅清理主目录）');
-    console.log('⚠  将移除 TeamAI 主目录:');
+    console.log('⚠  Uninstalling user scope (no valid configuration detected — home directory only)');
+    console.log('⚠  The following TeamAI home directory will be removed:');
     console.log(`     ${home}/`);
     console.log('');
 
     if (opts.dryRun) {
-      log.info('Dry run — 未做任何更改');
+      log.info('Dry run — no changes made');
       return;
     }
 
     if (!opts.force) {
-      const confirmed = await askConfirmation('确认卸载? [y/N] ');
+      const confirmed = await askConfirmation('Confirm uninstall? [y/N] ');
       if (!confirmed) {
-        log.info('已取消');
+        log.info('Cancelled');
         return;
       }
     }
@@ -790,10 +858,10 @@ export async function uninstall(opts: UninstallOptions): Promise<void> {
     try {
       await teardownPlugins();
       await remove(home);
-      log.success(`移除 ${home}/`);
-      log.success('teamai 卸载完成');
+      log.success(`Removed ${home}/`);
+      log.success('teamai uninstalled');
     } catch (e) {
-      log.warn(`移除 ${home} 失败: ${(e as Error).message}`);
+      log.warn(`Failed to remove ${home}: ${(e as Error).message}`);
     }
   }
 }
