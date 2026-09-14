@@ -548,11 +548,6 @@ async function pullForScope(
   const targetsField = revisionField === 'lastPullRev'
     ? 'lastPullTargets' as const
     : 'lastInheritedPullTargets' as const;
-  const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
-  if (!teamConfig) {
-    log.warn(`[${scopeLabel}] Team config (teamai.yaml) not found. Skipping.`);
-    return;
-  }
 
   // Step 1: refresh team repo (git pull, or HTTP /repo materialization)
   const pullSpin = spinner(`[${scopeLabel}] Pulling team repo...`).start();
@@ -579,13 +574,21 @@ async function pullForScope(
     return;
   }
 
+  // Read teamai.yaml only after the refresh: a clone that lacks it must still
+  // be able to fetch it from the remote instead of skipping forever.
+  const freshConfig = await loadTeamConfig(localConfig.repo.localPath);
+  if (!freshConfig) {
+    log.warn(`[${scopeLabel}] Team config (teamai.yaml) not found. Skipping.`);
+    return;
+  }
+
   // Step 1b: Skip sync if the repo version hasn't changed since last pull
   let currentTargets: string[] | null = null;
   if (!options.force && !options.dryRun && !submodulesChanged) {
     try {
       const state = await loadStateForScope(localConfig);
       if (currentRev && state[revisionField] && state[revisionField] === currentRev) {
-        currentTargets = await getInstalledResourceTargets(teamConfig, localConfig);
+        currentTargets = await getInstalledResourceTargets(freshConfig, localConfig);
         const previousTargets = state[targetsField];
         const syncedTargets = new Set(previousTargets ?? []);
         const targetSetMatches = previousTargets !== undefined
@@ -595,18 +598,13 @@ async function pullForScope(
         if (targetSetMatches) {
           log.success(`[${scopeLabel}] Already synced at ${currentRev}, skipping`);
           // 即使 repo 未变化，仍部署 CLI 内置资源（确保 CLI 升级后新版本 agent/rules 生效）
-          if (!options.dryRun) {
-            const cfg = await loadTeamConfig(localConfig.repo.localPath);
-            if (cfg) {
-              const skipRecall = !isRecallEnabled(localConfig, cfg);
-              try { const { deployBuiltinAgents } = await import('./builtin-agents.js'); await deployBuiltinAgents(cfg, localConfig, { skipRecall }); } catch {}
-              try { const { deployBuiltinRules } = await import('./builtin-rules.js'); await deployBuiltinRules(cfg, localConfig, { skipRecall }); } catch {}
-              try { const { deployBuiltinSkills } = await import('./builtin-skills.js'); await deployBuiltinSkills(cfg, localConfig, { reportingOnly, skipRecall }); } catch {}
-              // Also refresh the CLAUDE.md recall block so a CLI upgrade that ships
-              // a new block reaches CLAUDE.md even when the repo HEAD is unchanged.
-              await injectRecallBlockIntoTools(cfg, localConfig, scopeLabel);
-            }
-          }
+          const skipRecall = !isRecallEnabled(localConfig, freshConfig);
+          try { const { deployBuiltinAgents } = await import('./builtin-agents.js'); await deployBuiltinAgents(freshConfig, localConfig, { skipRecall }); } catch {}
+          try { const { deployBuiltinRules } = await import('./builtin-rules.js'); await deployBuiltinRules(freshConfig, localConfig, { skipRecall }); } catch {}
+          try { const { deployBuiltinSkills } = await import('./builtin-skills.js'); await deployBuiltinSkills(freshConfig, localConfig, { reportingOnly, skipRecall }); } catch {}
+          // Also refresh the CLAUDE.md recall block so a CLI upgrade that ships
+          // a new block reaches CLAUDE.md even when the repo HEAD is unchanged.
+          await injectRecallBlockIntoTools(freshConfig, localConfig, scopeLabel);
           return;
         }
 
@@ -616,13 +614,6 @@ async function pullForScope(
       // If rev check fails, proceed with full sync
       log.debug(`[${scopeLabel}] Rev check failed, proceeding with full sync`);
     }
-  }
-
-  // Reload team config after pull (might have changed)
-  const freshConfig = await loadTeamConfig(localConfig.repo.localPath);
-  if (!freshConfig) {
-    log.warn(`[${scopeLabel}] Team config disappeared after pull. Skipping.`);
-    return;
   }
 
   // Load role context (if primaryRole configured)
