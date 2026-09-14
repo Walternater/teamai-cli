@@ -65,6 +65,46 @@ worktree reports the same first entry, giving a shared-yet-distinct identity in 
 cases. Both anchors are `realpath`-normalized so a symlinked prefix (macOS `/tmp` →
 `/private/tmp`) does not make one checkout look like two.
 
+### Partition naming (#546 + adoption)
+
+`slug(anchor) = <safe-path>-<sha256(normalized anchor) first 16 hex>` — the whole
+anchor path made filesystem-safe (leading separator dropped, separators and other
+unsafe chars → `-`), so the directory name reads back to its project, mirroring
+Claude Code's `~/.claude/projects/` naming: `/Users/x/Project/app` →
+`Users-x-Project-app-<hash>`. The trailing hash is what guarantees uniqueness
+(a `/`→`-` escape alone is not injective: `/x/my-proj` and `/x/my/proj` would
+collide and silently merge two projects' plaintext env), and the prefix is
+length-bounded so a deep path can never overflow `NAME_MAX`. The per-partition
+`anchor` file stays the authoritative reverse lookup.
+
+Because #546 changed the prefix without changing the hash, partitions written by
+older teamai (`<safe-basename>-<hash>`) are **adopted, not stranded**: every seam
+that resolves "this project's partition" (detection, init, migration) goes through
+`resolvePartitionDir`, which computes the anchor's exact legacy name and ATOMICALLY
+RENAMES the directory into the current name (same-parent metadata move — no data
+copied, an interruption leaves either name intact). A partition that cannot be
+renamed (read-only home) keeps serving under its legacy name; an authoritative
+current-format partition is never clobbered by a leftover legacy one. `status
+--all` never renames (read-only) — it reports a legacy-named partition as
+`active (legacy name; renamed automatically on next command)` instead of corrupt.
+
+The rename alone is not enough: `repo.localPath` is stored in config.yaml as an
+ABSOLUTE path to the team-repo clone (`<oldPartition>/team-repo`), so adoption
+also rebases it onto the new directory — otherwise `pull` would read the team
+config from a now-gone path and silently skip the sync (exit 0, "Team config not
+found"). The rewrite is idempotent (a modern install's localPath already sits in
+the canonical dir and is left untouched; an external clone outside the partition
+is left untouched) and self-healing (it finishes an adoption that crashed between
+the rename and the config rewrite) — the same `repo.localPath` rebase that
+`migrate.ts` applies when moving a legacy `.teamai/` into a partition.
+
+The rewrite is ATOMIC (same-dir temp file + rename, via `writeFileAtomic`). By
+this point the legacy source has already been renamed away, so config.yaml is the
+partition's only copy; a plain overwrite that failed partway (ENOSPC, EFBIG, a
+crash mid-write) would truncate it with no way back. rename(2) is atomic, so a
+failed write removes the temp file and leaves the original config.yaml intact —
+the next command retries the (idempotent) rebase and converges.
+
 ## P0 (this PR) — atomic lock + anchor split
 
 P0 is deliberately **structural**: it establishes the primitive and fixes
