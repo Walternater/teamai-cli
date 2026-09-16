@@ -78,7 +78,10 @@ projects:
       knowledge: [hai-inference]
       skills:    [hai-inference]
       learnings: [hai-inference]   # makes the learnings namespace actually take effect
+      agents:    [hai-inference]   # optional; agents/<namespace>/ scoped to this project
 ```
+
+Agent push uses the same role/project namespace resolution as pull and skips ambiguous source destinations. On a role or project change, agent cleanup checks each tool destination independently, including YAML `targets` and legacy format support. Locally edited copies are preserved.
 
 Directory layout reuses the existing namespace convention, adding one learnings layer:
 
