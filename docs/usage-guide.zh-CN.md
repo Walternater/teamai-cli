@@ -1430,10 +1430,11 @@ teamai stats           # skill 使用统计
 teamai update --check  # 仅检查 CLI 更新，不安装
 teamai update          # 检查并安装 CLI 更新
 teamai digest          # 生成团队活动周报
-teamai remove skills <name>   # 删除资源
+teamai remove skills <name>   # 删除资源（需要确认）
 teamai remove rules <name>
 teamai remove agents <name>
 teamai remove mcp <name>
+teamai remove rules <name> --force   # 跳过确认，用于脚本和 CI
 ```
 
 仅当所有检查通过时，`teamai doctor` 才以状态码 0 退出；任一检查失败时以状态码 1 退出。尚未初始化时，它只报告缺少配置，不会臆测 Git 托管平台。
