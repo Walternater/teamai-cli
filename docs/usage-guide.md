@@ -951,7 +951,7 @@ Options:
 The dashboard includes a built-in **KB Health** report page showing your team knowledge base's usage and health, covering everything captured by `teamai recall` votes, learnings, docs, rules, and skills.
 
 ```bash
-# Start the dashboard, then click "KB Health" in the header
+# Start the dashboard, then open "Team Context" (KB Health) or "Team Improvement" (maintenance)
 teamai dashboard
 
 # The report is served directly at:
@@ -968,14 +968,14 @@ The report aggregates your local `~/.teamai` knowledge base (or the configured t
 | **Coverage by type** | Breakdown of recall coverage across skills, rules, docs, learnings |
 | **Top recalled** | Ranked list of most frequently recalled entries |
 | **Silent entries** | Entries that have never been recalled — candidates for pruning or rewriting |
-| **Recall trend** | Recall activity over time |
+| **Last-recall month** | Each entry counts once in its latest recall month, not monthly recall volume |
 | **Author contributions** | Per-contributor entry counts and recall share |
 | **Maintenance console** | Three action zones: entries ready to promote, entries suggested for archiving, and stale entries needing updates — each with a copyable command |
 
 ### Typical Workflow
 
 ```
-Open the dashboard → KB Health page
+Open the dashboard → Team Improvement
    ↓
 Review the Maintenance Console
    ↓
@@ -1277,11 +1277,15 @@ teamai dashboard             # Start the web dashboard (default port 3721)
 teamai dashboard --port 8080
 ```
 
-View team members' AI coding session status in real time.
+The sidebar contains **Overview**, **Team Execution**, **Team Context** and **Team Improvement**. Overview summarizes the three modules. Execution shows this machine's sessions, filters by working directory and AI tool, and opens complete session details. Context contains KB Health (including author contributions and never-recalled entries); Improvement contains local trends and the original promotion/archive/quality-update maintenance commands. Commands are displayed for use in your terminal; the dashboard does not execute them.
+
+Use the header to select English or Simplified Chinese and light, dark, or system theme. Preferences are saved in browser storage when available. User prompts, AI output, knowledge titles and commands are not translated. The standalone `/kb-report` remains available as the original complete report.
+
+Live status is **local**, using the existing events/SSE stream with automatic reconnect and a session reconciliation poll. Recently ended sessions remain visible for the existing 30-second retention window. Knowledge reports show their local/team scope and generation time, **not a claimed team sync time or cross-member live status**. A failed refresh is labeled and any previous result is retained until a successful retry.
 
 #### Human Intervention Metrics
 
-Each session card shows a `⚠ N` badge, counting the **number of human interventions** in that conversation — fewer interventions means the agent is better at getting things right on the first try. Hover to see a breakdown; each of the three signal types counts once:
+Each session row shows the **number of human interventions**. Hover over the count or open Details for the breakdown; each of the three signal types counts once:
 
 | Type | Meaning | Data source |
 |------|------|----------|
@@ -1289,7 +1293,7 @@ Each session card shows a `⚠ N` badge, counting the **number of human interven
 | `toolReject` | User rejected a tool call (permission deny) | A tool_result marked as rejected in the transcript |
 | `correction` | Within 60s after the agent stops, the user submits a follow-up prompt containing a correction keyword ("not right" / "redo" / "wrong" / 「違う」 / 「やり直し」 / etc. — Chinese, English and Japanese built in, plus any team keywords) | The stop → prompt_submit event pattern |
 
-> Privacy: only counts are tracked — no prompt or transcript text is ever stored.
+> Privacy: shared intervention statistics contain counts. The local dashboard event stream can retain captured prompts and AI output for session details; these are not uploaded by this page.
 
 Keywords in a space-separated script (English, Spanish, ...) must appear as a whole word, so Spanish "segundo" does not count as `undo`. Chinese and Japanese keywords match as substrings. The built-in list covers only Chinese, English and Japanese; a correction typed in any other language is not detected until the team adds its own words in `teamai.yaml`. Team words are merged with the built-in list and matched case-insensitively under the same rules:
 
@@ -1307,20 +1311,20 @@ Intervention data is automatically aggregated and reported to the team's `stats/
 
 #### Conversation Volume & Token Usage
 
-Each session card also shows two badges:
+Each session row also shows two columns; Details retains full captured prompts, Markdown AI output, timestamps and the last tool:
 
-| Badge | Meaning | Data source |
+| Column | Meaning | Data source |
 |------|------|----------|
-| `💬 N` | The **number of human conversation turns** in the session (how many prompts were sent) | Count of `UserPromptSubmit` events |
-| `⛁ X` | The session's cumulative **token usage** (hover to see input / output / cache read / cache write breakdown) | Claude Code `message.usage`, CodeBuddy `requests[].usage`, or Codex's latest session-level `token_usage_record`; legacy `event_msg.token_count` snapshots are summed once per rollout file |
+| Prompts | The **number of human conversation turns** in the session (how many prompts were sent) | Count of `UserPromptSubmit` events |
+| Tokens | The session's cumulative **token usage** (hover to see input / output / cache read / cache write breakdown) | Claude Code `message.usage`, CodeBuddy `requests[].usage`, or Codex's latest session-level `token_usage_record`; legacy `event_msg.token_count` snapshots are summed once per rollout file |
 
-> Privacy: only turn counts and token counts are tracked — no prompt or transcript text is ever stored.
+> Privacy: shared turn/token metrics contain counts only. Captured prompts and output in dashboard details remain on this machine.
 
 These two metrics are likewise aggregated into `stats/<user>.yaml` (as `prompts` and `tokens` fields) during `teamai pull`, and shown in the "Conversation Volume & Token Usage" section of `teamai digest`, with team-wide totals, bucketed token totals, and per-person token usage rankings. Tools without transcript access (e.g. Cursor) degrade gracefully: turn counts are still tracked, while tokens show as 0 / N/A.
 
 #### Daily Session Trends & Estimated Cost
 
-The dashboard and digest compare the latest seven UTC calendar days with the seven days before them. A session belongs to the day of its first stop event, while each priced request belongs to its own UTC request day. Active time counts only adjacent event gaps of five minutes or less, so idle terminals do not inflate the result. A session succeeds when it ends without an error, interruption, or correction; rejected tool calls remain a separate intervention signal. Privacy-safe request details (model, token counts, estimated cost, and price-table version; no prompt or response content) stay in `~/.teamai/dashboard/requests.jsonl`, are deduplicated across repeated Stop hooks, and are removed after 90 days.
+The dashboard and digest compare the latest seven UTC calendar days with the seven days before them. The dashboard cost card now uses **average known estimated cost per priced session**: sum the available priced-request costs of sessions whose first Stop falls within the period, then divide by the number of those sessions with at least one priced request. Unpriced sessions are excluded; a priced zero-cost session is included. The card reports priced-session coverage. A resumed session keeps its first-Stop cohort and adds its available costs, even if a request occurred on another day. The original `avgRequestCostMicros` API field and digest request-day accounting remain unchanged. A session belongs to the day of its first stop event, while each priced request belongs to its own UTC request day. Active time counts only adjacent event gaps of five minutes or less, so idle terminals do not inflate the result. A session succeeds when it ends without an error, interruption, or correction; rejected tool calls remain a separate intervention signal. Privacy-safe request details (model, token counts, estimated cost, and price-table version; no prompt or response content) stay in `~/.teamai/dashboard/requests.jsonl`, are deduplicated across repeated Stop hooks, and are removed after 90 days.
 
 Cost is an API-equivalent estimate for recognized Claude model IDs, based on versioned public list prices and the input, output, cache-read, and cache-creation token buckets in the transcript. Cache creation uses the five-minute write rate because transcripts do not expose cache TTL. Unknown models and tools without usage details are excluded from both estimated cost and its coverage denominator. This estimate is useful for trends, but it is not an invoice or a subscription-seat charge.
 
@@ -1791,3 +1795,5 @@ teamai remove rules <name>
 
 > **Repo**: https://github.com/Tencent/teamai-cli
 > **Feedback**: file an Issue in the repo
+
+Dashboard workspace selection supports installed project scopes and user scope. Linked worktrees share a project. The all-workspaces view shows all local sessions and the startup knowledge scope. Health report sections are integrated into Team Context and Team Improvement. Restart the dashboard to discover newly installed scopes.

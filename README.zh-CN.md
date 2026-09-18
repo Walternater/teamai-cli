@@ -267,8 +267,8 @@ teamai recall maintenance --update-quality       # 为过时 skills / docs 生�
 |------|------|----------|
 | **用量（Usage）** | `teamai digest` | 团队周报——近 7 天成功率、对话、活跃时长、估算成本、缓存与纠偏趋势，以及历史累计数据。 |
 | **会话（Sessions）** | `teamai session save` | 脱敏的单会话摘要（工具序列、对话轮次、干预次数），喂给周报的 Session Highlights。 |
-| **看板（Dashboard）** | `teamai dashboard` | Web 看板，展示实时会话，以及本机近 7 天相对前 7 天的趋势。 |
-| **知识库健康（KB Health）** | `teamai dashboard` → KB Health | 内置于看板的报告页面，展示知识库使用情况与健康状态——各类型覆盖率、高频召回条目、沉默条目、召回趋势、作者贡献及维护控制台。 |
+| **看板（Dashboard）** | `teamai dashboard` | 统一的 Overview / Team Execution / Team Context / Team Improvement 界面，保留本机实时会话、近 7 天趋势、每会话估算费用，支持中英文及日间/夜间/跟随系统主题。 |
+| **知识库健康（KB Health）** | `teamai dashboard` → Team Context / Team Improvement | 保留各类型覆盖率、高频召回与沉默条目、最近召回月份统计、作者贡献及维护控制台；完整 `/kb-report` 报告仍可访问。 |
 
 ## 命令一览
 

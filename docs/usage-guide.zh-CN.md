@@ -924,7 +924,7 @@ teamai recall promote <learningId> --dry-run
 看板内置了一个 **KB Health**（知识库健康）报告页面，展示团队知识库的使用情况与健康状态，涵盖 `teamai recall` 投票、learnings、docs、rules 和 skills 采集到的所有数据。
 
 ```bash
-# 启动看板后，点击顶部的 "KB Health" 链接
+# 启动看板后，进入 Team Context（知识库健康）或 Team Improvement（维护）
 teamai dashboard
 
 # 报告也可直接访问：
@@ -941,14 +941,14 @@ teamai dashboard
 | **各类型覆盖率** | skills、rules、docs、learnings 的召回覆盖率分类 |
 | **高频召回排行** | 召回次数最多的条目排名列表 |
 | **沉默条目** | 从未被召回的条目——待剪枝或重写的候选 |
-| **召回趋势** | 召回活跃度随时间的变化 |
+| **最近召回月份** | 每条知识仅在最近一次召回的月份计数一次，不表示每月召回总次数 |
 | **作者贡献** | 每位贡献者的条目数与召回占比 |
 | **维护控制台** | 三个操作区：待晋升条目、建议归档条目、过时待更新条目，每条附可复制命令 |
 
 ### 典型工作流
 
 ```
-打开看板 → KB Health 页面
+打开看板 → Team Improvement
    ↓
 查看维护控制台
    ↓
@@ -1237,11 +1237,15 @@ teamai dashboard             # 启动 Web 面板（默认端口 3721）
 teamai dashboard --port 8080
 ```
 
-实时查看团队成员的 AI 编码会话状态。
+侧栏包含 **Overview（总览）**、**Team Execution（团队执行）**、**Team Context（团队上下文）**、**Team Improvement（团队改进）**。总览汇总三模块；执行页展示本机会话，支持工作目录和 AI 工具筛选及完整详情；上下文页保留 KB Health（含作者贡献和从未召回条目）；改进页保留本机趋势及晋升、归档、质量更新维护命令。命令需在终端使用，页面不执行维护操作。
+
+页头支持英文/简体中文及日间/夜间/跟随系统主题，浏览器存储可用时记住偏好。用户输入、AI 输出、知识标题和命令保持原文。独立 `/kb-report` 继续提供原有完整报告。
+
+实时状态仅限**本机**，沿用事件流与 SSE，支持自动重连并轮询校准会话状态。最近结束会话仍按原有 30 秒保留窗口展示。知识报告显示本机/团队来源及报告生成时间，**不将其称为团队同步时间或跨成员实时状态**。刷新失败时明确提示，并保留上一次成功结果供参考。
 
 #### 人工干预指标（Human Intervention）
 
-每个会话卡片会显示一个 `⚠ N` 徽标，统计该对话中用户的**人工干预次数**——干预越少，说明 agent 一次把事做对的能力越强。鼠标悬停可看分类明细，三类信号各计一次：
+每个会话行显示**人工干预次数**，悬停或打开详情可查看分类明细，三类信号各计一次：
 
 | 类型 | 含义 | 数据来源 |
 |------|------|----------|
@@ -1249,7 +1253,7 @@ teamai dashboard --port 8080
 | `toolReject` | 用户拒绝某个工具调用（permission deny） | transcript 中标记拒绝的 tool_result |
 | `correction` | agent stop 后 60s 内用户追加含「不对 / 重来 / 错了 / wrong / redo / 違う / やり直し」等纠偏词（内置中、英、日，外加团队自定义词）的 prompt | stop → prompt_submit 事件模式 |
 
-> 隐私：只统计**次数**，不落地任何 prompt 或 transcript 原文。
+> 隐私：团队共享的干预统计仅含计数。本机 dashboard 事件流可保存已捕获输入与 AI 输出用于详情展示，页面不会上传这些内容。
 
 以空格分词的文字（英语、西班牙语等）中的纠偏词必须整词匹配，因此西班牙语 "segundo" 不会被算作 `undo`；中文、日文纠偏词仍按子串匹配。内置列表只覆盖中、英、日三种语言，其他语言的纠偏在团队于 `teamai.yaml` 添加自己的词之前不会被识别。团队词与内置列表合并，忽略大小写，遵循同样的匹配规则：
 
@@ -1267,20 +1271,20 @@ sharing:
 
 #### 对话量与 Token 用量
 
-每个会话卡片还会显示两个徽标：
+每个会话行还显示以下两列；详情保留完整已捕获输入、Markdown AI 输出、时间戳和最近工具：
 
-| 徽标 | 含义 | 数据来源 |
+| 列 | 含义 | 数据来源 |
 |------|------|----------|
-| `💬 N` | 该会话里**人类对话的轮数**（发了几次 prompt） | `UserPromptSubmit` 事件数 |
-| `⛁ X` | 该会话累计 **token 用量**（鼠标悬停看 输入 / 输出 / 缓存读 / 缓存写 明细） | Claude Code `message.usage`、CodeBuddy `requests[].usage`，或 Codex 最新的会话级 `token_usage_record`；旧版 `event_msg.token_count` 按 rollout 文件各取最新快照后累加 |
+| 对话轮数 | 该会话里**人类对话的轮数**（发了几次 prompt） | `UserPromptSubmit` 事件数 |
+| Token | 该会话累计 **token 用量**（鼠标悬停看 输入 / 输出 / 缓存读 / 缓存写 明细） | Claude Code `message.usage`、CodeBuddy `requests[].usage`，或 Codex 最新的会话级 `token_usage_record`；旧版 `event_msg.token_count` 按 rollout 文件各取最新快照后累加 |
 
-> 隐私：只统计**轮数与 token 数量**，不落地任何 prompt 或 transcript 原文。
+> 隐私：团队共享的轮数和 Token 指标仅含计数。Dashboard 详情中的输入和输出保留在本机。
 
 这两项同样随 `teamai pull` 聚合到 `stats/<user>.yaml`（`prompts` 与 `tokens` 字段），并在 `teamai digest` 的「对话量与 Token 用量」板块给出团队对话总轮数、token 总量（分桶）与人均 token 用量排行。拿不到 transcript 的工具（如 Cursor）会优雅降级：仍统计对话轮数，token 显示为 0 / N/A。
 
 #### 每日会话趋势与估算成本
 
-Dashboard 和 digest 会比较最近 7 个 UTC 自然日与此前 7 天。会话归属到首次 stop 事件所在日期，每个已定价请求则归属到请求自身的 UTC 日期；活跃时长只累计不超过 5 分钟的相邻事件间隔，避免终端空闲时间把数据放大。会话结束时没有错误、中断或纠偏才计为成功；被拒绝的工具调用仍作为独立干预信号统计。仅包含模型、token 数、估算成本和价格表版本的请求明细保存在本地 `~/.teamai/dashboard/requests.jsonl`，不包含提示词或回复内容；重复 Stop 不会重复写入，超过 90 天会自动清理。
+Dashboard 和 digest 会比较最近 7 个 UTC 自然日与此前 7 天。Dashboard 费用卡片改为**有定价数据会话的平均已知估算费用**：先筛选首次 Stop 落在该窗口的会话，汇总这些会话已知的已定价请求费用，再除以其中至少有一个已定价请求的会话数。无定价数据的会话不进分母；已定价且费用为零的会话计入。卡片展示定价覆盖数。恢复执行的会话仍归属首次 Stop 日期，其他日期的已知请求费用也计入该会话。原有 `avgRequestCostMicros` 接口字段和 digest 按请求日期统计的口径不变。会话归属到首次 stop 事件所在日期，每个已定价请求则归属到请求自身的 UTC 日期；活跃时长只累计不超过 5 分钟的相邻事件间隔，避免终端空闲时间把数据放大。会话结束时没有错误、中断或纠偏才计为成功；被拒绝的工具调用仍作为独立干预信号统计。仅包含模型、token 数、估算成本和价格表版本的请求明细保存在本地 `~/.teamai/dashboard/requests.jsonl`，不包含提示词或回复内容；重复 Stop 不会重复写入，超过 90 天会自动清理。
 
 成本是 API 等价估算值：对可识别的 Claude 模型，根据带版本的公开目录价，以及 transcript 中的输入、输出、缓存读取和缓存写入 token 分桶计算。由于 transcript 不提供缓存 TTL，缓存写入按 5 分钟费率估算。未知模型以及无法取得详细用量的工具不会进入估算成本，也不会进入成本覆盖率分母。该数据适合观察趋势，但不等同于账单或订阅席位费用。
 
@@ -1743,3 +1747,5 @@ teamai remove rules <name>
 
 > **仓库**：https://github.com/Tencent/teamai-cli
 > **问题反馈**：https://github.com/Tencent/teamai-cli/issues
+
+仪表盘支持切换已安装的项目范围和用户范围，同一项目的 worktree 归为一个项目。全部工作区显示全部本机会话及启动时知识库范围。健康报告已整合进团队上下文和团队改进。新安装范围后重启仪表盘以发现新范围。

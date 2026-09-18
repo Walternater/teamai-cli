@@ -267,8 +267,8 @@ teamai recall maintenance --update-quality       # draft updates for stale skill
 |------|----------|----------|
 | **Usage** | `teamai digest` | チームの週次 digest — 直近 7 日の成功率、prompt、アクティブ時間、推定コスト、cache、訂正の傾向と、累計値。 |
 | **Sessions** | `teamai session save` | プライバシーを除去したセッション要約（ツール列、prompt ターン、介入）。digest の Session Highlights の入力になります。 |
-| **Dashboard** | `teamai dashboard` | ライブセッションと、直近 7 日をその前の 7 日と比較したローカルトレンドを示す Web dashboard。 |
-| **KB Health** | `teamai dashboard` → KB Health | 組み込みの dashboard ページ。ナレッジベースの利用と健全性（タイプ別カバレッジ、よく recall されるエントリ、沈黙エントリ、recall トレンド、作者の貢献、メンテナンスコンソール）を報告します。 |
+| **Dashboard** | `teamai dashboard` | Overview / Team Execution / Team Context / Team Improvement を統合。本機のライブセッション、7 日間の傾向、セッション当たり推定コスト、英語/簡体字中国語、ライト/ダーク/システムテーマに対応。 |
+| **KB Health** | `teamai dashboard` → Team Context / Team Improvement | 組み込みの dashboard ページ。ナレッジベースの利用と健全性（タイプ別カバレッジ、よく recall されるエントリ、沈黙エントリ、recall トレンド、作者の貢献、メンテナンスコンソール）を報告します。 |
 
 ## コマンド
 

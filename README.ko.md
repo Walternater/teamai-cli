@@ -267,8 +267,8 @@ teamai recall maintenance --update-quality       # draft updates for stale skill
 |------------|---------|---------------|
 | **Usage** | `teamai digest` | 주간 팀 digest — 7일간의 성공률, prompt, 활성 시간, 추정 비용, cache, 수정 추세와 누적 합계. |
 | **Sessions** | `teamai session save` | 개인정보를 제거한 세션별 요약(도구 순서, prompt 턴, 개입)으로 digest의 Session Highlights에 들어갑니다. |
-| **Dashboard** | `teamai dashboard` | 실시간 세션과, 직전 7일 대비 로컬 7일 추세를 보여주는 웹 dashboard. |
-| **KB Health** | `teamai dashboard` → KB Health | 지식 베이스 사용량과 건강 상태를 보여주는 내장 dashboard 페이지 — 유형별 커버리지, 상위 recall 항목, 침묵 항목, recall 추세, 작성자 기여, maintenance 콘솔. |
+| **Dashboard** | `teamai dashboard` | Overview / Team Execution / Team Context / Team Improvement 통합 화면. 로컬 실시간 세션, 7일 추세, 세션당 예상 비용, 영어/중국어 간체 및 밝게/어둡게/시스템 테마를 지원합니다. |
+| **KB Health** | `teamai dashboard` → Team Context / Team Improvement | 지식 베이스 사용량과 건강 상태를 보여주는 내장 dashboard 페이지 — 유형별 커버리지, 상위 recall 항목, 침묵 항목, recall 추세, 작성자 기여, maintenance 콘솔. |
 
 ## 명령어
 
