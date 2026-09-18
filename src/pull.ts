@@ -48,7 +48,7 @@ import { withTimeout } from './utils/async.js';
 let pendingUsageReport: Promise<void> | undefined;
 const FILE_NOT_FOUND_ERROR_CODE = 'ENOENT';
 
-interface RolePullContext {
+export interface RolePullContext {
   activeNamespaces: ResourceNamespaces;
   activeSkillNames: Set<string>;
   inactiveSkillNames: Set<string>;
@@ -314,6 +314,74 @@ export async function scanRoleAwareSkills(localConfig: LocalConfig, namespaces: 
   return [...items.values()];
 }
 
+/** What a member should have on disk, and what the team repo holds. */
+export interface DesiredSkills {
+  /** The skills this member should have: role namespaces ∪ subscribed tags − exclusions. */
+  items: ResourceItem[];
+  /** Every skill in the team repo — the set cleanup is allowed to prune from. */
+  teamItems: ResourceItem[];
+  /** How many skills the tag channel left out, for the sync line. */
+  skippedByTags: number;
+}
+
+/**
+ * Resolve the skills this member should have. Read-only: `pull` calls it to
+ * decide what to install, and `doctor` calls it to check what landed (#598).
+ * Keeping it in one place is the point — re-deriving the union inside the check
+ * would put role namespaces, tag subscriptions and exclusions in a second place
+ * that drifts on its own.
+ *
+ * `roleContext` is explicit rather than resolved here: `pullForScope` already
+ * holds one (it also drives rules, agents and cleanup), and null means "no roles
+ * configured", not "not looked up yet".
+ */
+export async function resolveDesiredSkills(
+  teamConfig: TeamaiConfig,
+  localConfig: LocalConfig,
+  roleContext: RolePullContext | null,
+): Promise<DesiredSkills> {
+  const handler = getHandler('skills');
+  const tagsConfig = await loadTagsConfig(localConfig.repo.localPath);
+  const subscribedTags = localConfig.subscribedTags;
+  const excludedSkills = new Set(localConfig.excludedSkills ?? []);
+
+  const directoryItems = roleContext
+    ? await scanRoleAwareSkills(localConfig, roleContext.activeNamespaces)
+    : await handler.scanTeamForPull(teamConfig, localConfig);
+
+  const teamItems = await handler.scanTeamForPull(teamConfig, localConfig);
+
+  // Tag channel: only augment when subscriptions are actually active
+  const hasActiveTagSubscriptions = tagsConfig != null
+    && subscribedTags != null
+    && subscribedTags.length > 0;
+
+  let tagIncluded: ResourceItem[] = [];
+  let skippedByTags = 0;
+  if (hasActiveTagSubscriptions) {
+    const tagResult = filterByTags(teamItems, tagsConfig, subscribedTags, 'skills');
+    const subscribedTagSet = new Set(subscribedTags);
+    tagIncluded = tagResult.included.filter((item) => {
+      const itemTags = tagsConfig.skills[item.name];
+      return itemTags?.some((tag) => subscribedTagSet.has(tag));
+    });
+    skippedByTags = tagResult.skipped.length;
+  }
+
+  // Union: merge directory items with tag-matched items
+  const merged = new Map<string, ResourceItem>();
+  for (const item of directoryItems) merged.set(item.name, item);
+  for (const item of tagIncluded) {
+    if (!merged.has(item.name)) merged.set(item.name, item);
+  }
+
+  const items = excludedSkills.size > 0
+    ? [...merged.values()].filter((item) => !excludedSkills.has(item.name))
+    : [...merged.values()];
+
+  return { items, teamItems, skippedByTags };
+}
+
 // Deployment adds a CONTRIBUTORS file that the team source may not have; ignore it
 // when checking whether a deployed skill still matches its source (same file as
 // resources/skills.ts and pre-push-sync.ts use for modification detection).
@@ -563,6 +631,13 @@ async function cleanupTombstonedResources(
 async function pullForScope(
   localConfig: LocalConfig,
   options: GlobalOptions,
+  /**
+   * Collects what this scope tells the member in its own words, so the
+   * post-pull pass does not repeat it. Required rather than optional on
+   * `policy`: a call site that forgot it would silently stop recording, which
+   * is the failure this mechanism exists to avoid. See `Check.reportedByPull`.
+   */
+  reported: Set<string>,
   policy: {
     resourceTypes?: readonly ResourceType[];
     revisionField?: 'lastPullRev' | 'lastInheritedPullRev';
@@ -612,6 +687,7 @@ async function pullForScope(
     if (queue.remaining > 0) {
       // Say it out loud. A member whose pushes are rejected would otherwise
       // queue notes forever and never hear about it.
+      reported.add('pending-learnings');
       log.warn(
         `${queue.remaining} learning(s) are written locally but not published`
         + `${queue.lastError ? `: ${queue.lastError}` : ''}. `
@@ -728,41 +804,12 @@ async function pullForScope(
     let items: ResourceItem[];
     let skippedByTags = 0;
     if (type === 'skills') {
-      const directoryItems = roleContext
-        ? await scanRoleAwareSkills(localConfig, roleContext.activeNamespaces)
-        : await handler.scanTeamForPull(freshConfig, localConfig);
-
-      const allTeamSkills = await handler.scanTeamForPull(freshConfig, localConfig);
-
-      // Tag channel: only augment when subscriptions are actually active
-      const hasActiveTagSubscriptions = tagsConfig != null
-        && subscribedTags != null
-        && subscribedTags.length > 0;
-
-      let tagIncluded: ResourceItem[] = [];
-      if (hasActiveTagSubscriptions) {
-        const tagResult = filterByTags(allTeamSkills, tagsConfig, subscribedTags, 'skills');
-        const subscribedTagSet = new Set(subscribedTags);
-        tagIncluded = tagResult.included.filter((item) => {
-          const itemTags = tagsConfig.skills[item.name];
-          return itemTags?.some((tag) => subscribedTagSet.has(tag));
-        });
-        skippedByTags = tagResult.skipped.length;
-      }
-
-      // Union: merge directory items with tag-matched items
-      const merged = new Map<string, ResourceItem>();
-      for (const item of directoryItems) merged.set(item.name, item);
-      for (const item of tagIncluded) {
-        if (!merged.has(item.name)) merged.set(item.name, item);
-      }
-      items = [...merged.values()];
-      if (excludedSkills.size > 0) {
-        items = items.filter((item) => !excludedSkills.has(item.name));
-      }
+      const desired = await resolveDesiredSkills(freshConfig, localConfig, roleContext);
+      items = desired.items;
+      skippedByTags = desired.skippedByTags;
       desiredSkillNames = new Set(items.map((i) => i.name));
-      knownRepoSkillNames = new Set(allTeamSkills.map((i) => i.name));
-      knownRepoSkillSources = new Map(allTeamSkills.map((i) => [i.name, i.sourcePath]));
+      knownRepoSkillNames = new Set(desired.teamItems.map((i) => i.name));
+      knownRepoSkillSources = new Map(desired.teamItems.map((i) => [i.name, i.sourcePath]));
     } else if (type === 'agents') {
       // Role/project namespace filter (root = everyone), same as rules. Throws
       // on a stem collision; the caller's try/catch logs it and aborts the scope.
@@ -1564,6 +1611,11 @@ async function reinjectLegacyHooks(localConfig: LocalConfig): Promise<void> {
  * source skills are pulled only for the active project scope.
  */
 export async function pull(options: GlobalOptions): Promise<void> {
+  // What the scopes below say in their own words, so the post-pull pass does
+  // not repeat it. Owned here rather than at module scope so nothing survives
+  // into another call.
+  const reported = new Set<string>();
+
   // Whether HOME's settings.json still has the pre-dispatch hook format. Read now
   // (HOME-only, no shared clone), but the actual reinject runs later under the
   // scope lock so it never consumes a concurrent push's transient branch config.
@@ -1629,7 +1681,7 @@ export async function pull(options: GlobalOptions): Promise<void> {
           inheritedUserConfig = loadedUserConfig;
           log.info('project scope detected, inheriting user-scope resources and knowledge');
           if (await lockScope(inheritedUserConfig)) {
-            await pullForScope(inheritedUserConfig, options, {
+            await pullForScope(inheritedUserConfig, options, reported, {
               resourceTypes: ['skills', 'rules', 'docs', 'agents'],
               revisionField: 'lastInheritedPullRev',
             });
@@ -1637,7 +1689,7 @@ export async function pull(options: GlobalOptions): Promise<void> {
         } else {
           activeUserConfig = loadedUserConfig;
           if (await lockScope(activeUserConfig)) {
-            await pullForScope(activeUserConfig, options);
+            await pullForScope(activeUserConfig, options, reported);
           }
         }
       } else if (inheritUserScope) {
@@ -1654,7 +1706,7 @@ export async function pull(options: GlobalOptions): Promise<void> {
   if (projectConfig) {
     try {
       if (await lockScope(projectConfig)) {
-        await pullForScope(projectConfig, options);
+        await pullForScope(projectConfig, options, reported);
       }
     } catch (e) {
       log.warn(`Project-scope pull error: ${(e as Error).message}`);
@@ -1787,6 +1839,15 @@ export async function pull(options: GlobalOptions): Promise<void> {
       log.debug(`Source pull skipped: ${(e as Error).message}`);
     }
   }
+
+  // 6. Post-conditions. Everything above reported what it *did*; these report
+  //    what is actually on disk (issue #598). Only after an explicit pull: the
+  //    SessionStart hook runs pull({ silent: true }) and must stay free.
+  //    Skipped when any scope was contended: those are dropped from every
+  //    clone-consuming stage above for the same reason the checks would need
+  //    the clone, and reading it while the other process holds it on a
+  //    transient branch is how a diagnostic invents a failure.
+  await reportPostPullChecks(options, reported, contended.size > 0);
   } finally {
     const releaseSyncLocks = async () => {
       for (const lock of heldLocks.values()) await releaseLock(lock);
@@ -1801,6 +1862,81 @@ export async function pull(options: GlobalOptions): Promise<void> {
     } else {
       await releaseSyncLocks();
     }
+  }
+}
+
+/** Post-pull diagnostics are a courtesy, not the job. Do not wait forever. */
+const POST_PULL_CHECKS_TIMEOUT_MS = 5000;
+
+/**
+ * Re-run the `teamai doctor` registry after an explicit pull and print only what
+ * failed. Every line above this one reports what the pull *did*; these report
+ * what is actually on disk — the gap behind #574, #525, #342 and friends, where
+ * the command says "Synced N" and the tool receives nothing.
+ *
+ * Two kinds are left out. Provider checks: this pull just used the provider
+ * successfully, so re-probing `gh auth status` would add a subprocess to every
+ * sync and prove nothing new. And a check whose `reportedByPull` topic this run
+ * actually reported — repeating it would say the same thing twice and, since
+ * its `fix` is written for `doctor`, tell the member to run the pull they just
+ * ran. A topic the pull stayed silent about is NOT suppressed: the scope may
+ * have aborted before reaching it. `teamai doctor` still runs everything.
+ */
+async function reportPostPullChecks(
+  options: GlobalOptions,
+  reported: ReadonlySet<string>,
+  /**
+   * True when another process held a scope's sync lock this run. The checks
+   * resolve their own context from the shared clone, which that process may
+   * have on a transient branch, so their answers would be about its work in
+   * progress rather than about this machine.
+   */
+  contended: boolean,
+): Promise<void> {
+  if (options.silent || options.dryRun) return;
+  if (contended) {
+    // The pull already said the scope was skipped. Saying nothing more is the
+    // honest outcome; `teamai doctor` runs them once the other process is done.
+    log.debug('Post-pull checks skipped: another pull/push holds a scope lock');
+    return;
+  }
+  try {
+    const { resolveDoctorContext, buildChecks, runChecks, formatCheckResult } = await import('./doctor.js');
+    const ctx = await resolveDoctorContext();
+    if (!ctx) return;
+
+    // The budget covers building the registry as well as running it: the
+    // delivery checks stat every desired skill for every tool while the
+    // registry is built, which is where the I/O actually is.
+    const results = await withTimeout(
+      (async () => {
+        const local = (await buildChecks(ctx))
+          .filter((c) => c.source === 'local')
+          .filter((c) => !c.reportedByPull || !reported.has(c.reportedByPull));
+        return runChecks(local);
+      })(),
+      POST_PULL_CHECKS_TIMEOUT_MS,
+      `Post-pull checks are still running after ${POST_PULL_CHECKS_TIMEOUT_MS}ms`,
+    );
+
+    const failures = results.filter((r) => !r.ok);
+    if (failures.length === 0) return;
+
+    log.warn(`Pull finished, but ${failures.length} check(s) failed:`);
+    for (const failure of failures) {
+      const [headline, ...detail] = formatCheckResult(failure);
+      log.warn(headline);
+      for (const line of detail) log.dim(line);
+    }
+    log.dim('  Run `teamai doctor` for the full report.');
+  } catch (e) {
+    // The sync already succeeded. A diagnostic that breaks must not undo that,
+    // so this never rethrows. It does say one line though: staying silent after
+    // the whole budget is the same "reported success, nothing happened" shape
+    // these checks exist to catch. The reason stays on the debug channel
+    // because it is about teamai, not about the member's repo.
+    log.debug(`Post-pull checks skipped: ${(e as Error).message}`);
+    log.dim('  Post-pull checks did not run. Run `teamai doctor` for the full report.');
   }
 }
 
