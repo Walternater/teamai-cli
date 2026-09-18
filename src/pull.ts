@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { readFile } from 'node:fs/promises';
 import matter from 'gray-matter';
 import { requireInit, loadState, saveState, detectProjectConfig, loadLocalConfigForScope, loadTeamConfig, loadStateForScope, saveStateForScope } from './config.js';
 import { pullRepo, getHeadRev, createGit } from './utils/git.js';
@@ -7,7 +8,7 @@ import { pendingLearningsDir } from './utils/pending-learnings.js';
 import { learningsRoots } from './utils/learnings-roots.js';
 import { log, spinner } from './utils/logger.js';
 import { pathExists, remove, listFiles, listDirs, listFilesRecursive, readFileSafe, dirContentEqual, hasVcsMetadataRecursive } from './utils/fs.js';
-import { injectClaudeMdSection } from './utils/claudemd.js';
+import { injectClaudeMdSection, removeClaudeMdSection } from './utils/claudemd.js';
 import { getHandler, RulesHandler, DocsHandler, EnvHandler, AgentsHandler } from './resources/index.js';
 import { isToolInstalledForConfig, ResourceHandler } from './resources/base.js';
 import { ruleFileExtensionForTool } from './resources/rule-format.js';
@@ -45,6 +46,7 @@ import { withTimeout } from './utils/async.js';
 // A timed-out report still owns its success bookkeeping. Do not start another
 // batch in this process until it settles and finishes consuming its events.
 let pendingUsageReport: Promise<void> | undefined;
+const FILE_NOT_FOUND_ERROR_CODE = 'ENOENT';
 
 interface RolePullContext {
   activeNamespaces: ResourceNamespaces;
@@ -628,6 +630,16 @@ async function pullForScope(
     return;
   }
 
+  // Resolve role-scoped instruction sources before the revision fast path so
+  // CLI upgrades can refresh managed instruction blocks without a repo change.
+  let roleContext: RolePullContext | null = null;
+  try {
+    roleContext = await buildRolePullContext(localConfig);
+  } catch (e) {
+    log.error(`[${scopeLabel}] ${(e as Error).message}`);
+    return;
+  }
+
   // Step 1b: Skip sync if the repo version hasn't changed since last pull
   let currentTargets: string[] | null = null;
   if (!options.force && !options.dryRun && !submodulesChanged) {
@@ -648,6 +660,10 @@ async function pullForScope(
           try { const { deployBuiltinAgents } = await import('./builtin-agents.js'); await deployBuiltinAgents(freshConfig, localConfig, { skipRecall }); } catch {}
           try { const { deployBuiltinRules } = await import('./builtin-rules.js'); await deployBuiltinRules(freshConfig, localConfig, { skipRecall }); } catch {}
           try { const { deployBuiltinSkills } = await import('./builtin-skills.js'); await deployBuiltinSkills(freshConfig, localConfig, { reportingOnly, skipRecall }); } catch {}
+          // Refresh managed culture/shared-instruction blocks as well. A CLI
+          // upgrade may add a new target file while the team repo SHA and tool
+          // target set remain unchanged.
+          await syncManagedInstructions(freshConfig, localConfig, roleContext, scopeLabel);
           // Also refresh the CLAUDE.md recall block so a CLI upgrade that ships
           // a new block reaches CLAUDE.md even when the repo HEAD is unchanged.
           await injectRecallBlockIntoTools(freshConfig, localConfig, scopeLabel);
@@ -664,15 +680,6 @@ async function pullForScope(
       // If rev check fails, proceed with full sync
       log.debug(`[${scopeLabel}] Rev check failed, proceeding with full sync`);
     }
-  }
-
-  // Load role context (if primaryRole configured)
-  let roleContext: RolePullContext | null = null;
-  try {
-    roleContext = await buildRolePullContext(localConfig);
-  } catch (e) {
-    log.error(`[${scopeLabel}] ${(e as Error).message}`);
-    return;
   }
 
   // Load tags config for filtering
@@ -1046,65 +1053,9 @@ async function pullForScope(
     }
   }
 
-  // Step 3.6: Inject team culture into CLAUDE.md
+  // Steps 3.6-3.7: Inject team culture and shared instructions.
   if (!options.dryRun) {
-    try {
-      const culturePath = path.join(localConfig.repo.localPath, 'culture.md');
-      if (await pathExists(culturePath)) {
-        const cultureContent = await readFileSafe(culturePath);
-        if (cultureContent) {
-          const compiled = compileCulture(cultureContent);
-          if (compiled) {
-            const baseDir = resolveBaseDir(localConfig);
-            for (const [tool, toolPath] of Object.entries(scopedToolPaths(freshConfig, localConfig))) {
-              if (isAgentExcluded(localConfig, tool)) continue;
-              if (!toolPath.claudemd) continue;
-              if (toolPath.rules && !await ResourceHandler.isToolInstalled(toolPath.rules, baseDir)) continue;
-
-              const claudeMdPath = path.join(baseDir, toolPath.claudemd);
-              try {
-                await injectClaudeMdSection(claudeMdPath, TEAMAI_CULTURE_START, TEAMAI_CULTURE_END, compiled);
-                log.debug(`Injected culture into ${tool} CLAUDE.md`);
-              } catch (e) {
-                log.warn(`Failed to inject culture into ${tool} CLAUDE.md: ${(e as Error).message}`);
-              }
-            }
-            log.success('Synced team culture');
-          }
-        }
-      }
-    } catch (e) {
-      log.debug(`Culture sync skipped: ${(e as Error).message}`);
-    }
-  }
-
-  // Step 3.7: Inject shared claudemd instructions into CLAUDE.md
-  if (!options.dryRun) {
-    try {
-      const claudemdContents = await collectClaudemdFiles(
-          localConfig.repo.localPath, roleContext);
-      if (claudemdContents.length > 0) {
-        const compiled = compileClaudemd(claudemdContents);
-        if (compiled) {
-          const baseDir = resolveBaseDir(localConfig);
-          for (const [tool, toolPath] of Object.entries(scopedToolPaths(freshConfig, localConfig))) {
-            if (isAgentExcluded(localConfig, tool)) continue;
-            if (!toolPath.claudemd) continue;
-            if (toolPath.rules && !await ResourceHandler.isToolInstalled(toolPath.rules, baseDir)) continue;
-            const claudeMdPath = path.join(baseDir, toolPath.claudemd);
-            try {
-              await injectClaudeMdSection(claudeMdPath, TEAMAI_CLAUDEMD_START, TEAMAI_CLAUDEMD_END, compiled);
-              log.debug(`Injected shared instructions into ${tool} CLAUDE.md`);
-            } catch (e) {
-              log.warn(`Failed to inject shared instructions into ${tool} CLAUDE.md: ${(e as Error).message}`);
-            }
-          }
-          log.success(`[${scopeLabel}] Synced shared instructions (${claudemdContents.length} file(s))`);
-        }
-      }
-    } catch (e) {
-      log.debug(`Shared instructions sync skipped: ${(e as Error).message}`);
-    }
+    await syncManagedInstructions(freshConfig, localConfig, roleContext, scopeLabel);
   }
 
   // Step 3.8: Inject teamai-recall subagent rules block (Phase 1)
@@ -1307,6 +1258,91 @@ export function compileClaudemd(contents: string[]): string | null {
     ].join('\n');
 }
 
+/** Refresh culture and shared-instruction blocks for every installed target. */
+async function syncManagedInstructions(
+  config: TeamaiConfig,
+  localConfig: LocalConfig,
+  roleContext: RolePullContext | null,
+  scopeLabel: string,
+): Promise<void> {
+  const culturePath = path.join(localConfig.repo.localPath, 'culture.md');
+  let compiledCulture: string | null | undefined;
+  try {
+    const cultureContent = await readFile(culturePath, 'utf8');
+    compiledCulture = compileCulture(cultureContent) ?? undefined;
+    if (compiledCulture === undefined) {
+      log.warn(`Skipped team culture sync because ${culturePath} is empty or invalid`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === FILE_NOT_FOUND_ERROR_CODE) {
+      compiledCulture = null;
+    } else {
+      log.warn(`Failed to read team culture from ${culturePath}: ${(error as Error).message}`);
+    }
+  }
+
+  if (compiledCulture !== undefined) {
+    for (const [tool, toolPath] of Object.entries(scopedToolPaths(config, localConfig))) {
+      if (isAgentExcluded(localConfig, tool) || !toolPath.claudemd) continue;
+      if (toolPath.rules && !await isToolInstalledForConfig(tool, toolPath.rules, localConfig)) continue;
+
+      const claudeMdPath = path.join(resolveToolBaseDir(tool, localConfig), toolPath.claudemd);
+      try {
+        if (compiledCulture) {
+          await injectClaudeMdSection(
+            claudeMdPath,
+            TEAMAI_CULTURE_START,
+            TEAMAI_CULTURE_END,
+            compiledCulture,
+          );
+          log.debug(`Injected culture into ${tool} CLAUDE.md`);
+        } else {
+          await removeClaudeMdSection(claudeMdPath, TEAMAI_CULTURE_START, TEAMAI_CULTURE_END);
+        }
+      } catch (e) {
+        const action = compiledCulture ? 'inject culture into' : 'remove culture from';
+        log.warn(`Failed to ${action} ${tool} CLAUDE.md: ${(e as Error).message}`);
+      }
+    }
+  }
+  if (compiledCulture) {
+    log.success('Synced team culture');
+  }
+
+  try {
+    const claudemdContents = await collectClaudemdFiles(localConfig.repo.localPath, roleContext);
+    const compiled = compileClaudemd(claudemdContents);
+
+    for (const [tool, toolPath] of Object.entries(scopedToolPaths(config, localConfig))) {
+      if (isAgentExcluded(localConfig, tool) || !toolPath.claudemd) continue;
+      if (toolPath.rules && !await isToolInstalledForConfig(tool, toolPath.rules, localConfig)) continue;
+
+      const claudeMdPath = path.join(resolveToolBaseDir(tool, localConfig), toolPath.claudemd);
+      try {
+        if (compiled) {
+          await injectClaudeMdSection(
+            claudeMdPath,
+            TEAMAI_CLAUDEMD_START,
+            TEAMAI_CLAUDEMD_END,
+            compiled,
+          );
+          log.debug(`Injected shared instructions into ${tool} CLAUDE.md`);
+        } else {
+          await removeClaudeMdSection(claudeMdPath, TEAMAI_CLAUDEMD_START, TEAMAI_CLAUDEMD_END);
+        }
+      } catch (e) {
+        const action = compiled ? 'inject shared instructions into' : 'remove shared instructions from';
+        log.warn(`Failed to ${action} ${tool} CLAUDE.md: ${(e as Error).message}`);
+      }
+    }
+    if (compiled) {
+      log.success(`[${scopeLabel}] Synced shared instructions (${claudemdContents.length} file(s))`);
+    }
+  } catch (e) {
+    log.debug(`Shared instructions sync skipped: ${(e as Error).message}`);
+  }
+}
+
 /**
  * Inject (or replace) the teamai-recall block into every Tier-1 tool's CLAUDE.md.
  *
@@ -1327,14 +1363,14 @@ export async function injectRecallBlockIntoTools(
 ): Promise<void> {
     if (!isRecallEnabled(localConfig, config)) return;
     try {
-        const baseDir = resolveBaseDir(localConfig);
         const recallBlock = compileRecallRulesBlock();
         let injected = 0;
         for (const [tool, toolPath] of Object.entries(scopedToolPaths(config, localConfig))) {
             if (isAgentExcluded(localConfig, tool)) continue;
             if (!toolPath.claudemd || !toolPath.agents) continue;
-            if (!await ResourceHandler.isToolInstalled(toolPath.agents, baseDir)) continue;
+            if (!await isToolInstalledForConfig(tool, toolPath.agents, localConfig)) continue;
 
+            const baseDir = resolveToolBaseDir(tool, localConfig);
             const claudeMdPath = path.join(baseDir, toolPath.claudemd);
             try {
                 await injectClaudeMdSection(
