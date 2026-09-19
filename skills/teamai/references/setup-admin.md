@@ -166,11 +166,22 @@ three steps **in order**:
 
 (Headless/CI alternative: set `CNB_TOKEN` instead of `cnb login`.)
 
-### GitHub
+### GitHub — YOU run the login; user only clicks approve
+
+**Don't hand the user a `gh` command to run** — you run the login, they only approve
+it in the browser. Log them in before `teamai init`:
 
 ```bash
-gh auth login
+gh auth login --web --git-protocol https
 ```
+
+The flow prints a one-time code and a `https://github.com/login/device` URL.
+**Relay both to the user and ask them to open that URL and approve** — that approval
+is the *only* thing they do; the command finishes on its own once they do. Confirm
+with `gh auth status` before continuing.
+
+(Headless/CI only: skip the interactive login and pre-set `GITHUB_TOKEN` — a token
+with `repo` scope — instead.)
 
 ### GitLab (gitlab.com)
 
