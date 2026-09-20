@@ -11,6 +11,7 @@ import { pathExists, remove, listFiles, listDirs, listFilesRecursive, readFileSa
 import { injectClaudeMdSection, removeClaudeMdSection } from './utils/claudemd.js';
 import { getHandler, RulesHandler, DocsHandler, EnvHandler, AgentsHandler } from './resources/index.js';
 import { isToolInstalledForConfig, ResourceHandler } from './resources/base.js';
+import { skillsDirForTool } from './resources/skills.js';
 import { ruleFileExtensionForTool } from './resources/rule-format.js';
 import { AGENT_FILE_EXTENSIONS } from './resources/agent-format.js';
 import { loadTagsConfig, filterByTags } from './utils/tags.js';
@@ -383,6 +384,47 @@ export async function resolveDesiredSkills(
   return { items, teamItems, skippedByTags };
 }
 
+export interface DesiredRules {
+  /** The rules this member should have: active knowledge namespaces ∩ tag subscriptions. */
+  items: ResourceItem[];
+  /** How many rules the tag channel left out, for the sync line. */
+  skippedByTags: number;
+}
+
+/**
+ * Resolve the rules this member should have. Same contract as
+ * `resolveDesiredSkills`, and for the same reason: `pull` calls it to decide
+ * what to install and `doctor` calls it to check what landed (#624), so the
+ * namespace convention and the tag channel are stated once.
+ */
+export async function resolveDesiredRules(
+  teamConfig: TeamaiConfig,
+  localConfig: LocalConfig,
+  roleContext: RolePullContext | null,
+): Promise<DesiredRules> {
+  const handler = getHandler('rules');
+  const tagsConfig = await loadTagsConfig(localConfig.repo.localPath);
+  const allItems = await handler.scanTeamForPull(teamConfig, localConfig);
+  const knowledgeNs = roleContext ? roleContext.activeNamespaces.knowledge : null;
+  const roleFiltered = filterRulesByKnowledgeNamespaces(allItems, knowledgeNs);
+  const { included, skipped } = filterByTags(roleFiltered, tagsConfig, localConfig.subscribedTags, 'rules');
+  return { items: included, skippedByTags: skipped.length };
+}
+
+/**
+ * Resolve the agents this member should have. Throws on a stem collision
+ * between two active namespaces, the same way `pull` aborts the scope: a
+ * caller that cannot say what should be delivered must not guess.
+ */
+export async function resolveDesiredAgents(
+  teamConfig: TeamaiConfig,
+  localConfig: LocalConfig,
+  roleContext: RolePullContext | null,
+): Promise<ResourceItem[]> {
+  const items = await getHandler('agents').scanTeamForPull(teamConfig, localConfig);
+  return filterAgentsByNamespaces(items, roleContext ? roleContext.activeNamespaces.agents : null);
+}
+
 // Deployment adds a CONTRIBUTORS file that the team source may not have; ignore it
 // when checking whether a deployed skill still matches its source (same file as
 // resources/skills.ts and pre-push-sync.ts use for modification detection).
@@ -427,21 +469,22 @@ export async function cleanupInactiveNamespaceSkills(
   inactiveSkillNames: Set<string>,
   inactiveSkillSources?: Map<string, string>,
 ): Promise<void> {
-  const baseDir = resolveBaseDir(localConfig);
-
   for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     if (isAgentExcluded(localConfig, tool)) continue;
-    if (!toolPath.skills) continue;
-    if (!await ResourceHandler.isToolInstalled(toolPath.skills, baseDir)) continue;
-    if (!await pathExists(path.join(baseDir, toolPath.skills))) continue;
+    // Ask where delivery writes, not where the tool root sits: OpenClaw keeps
+    // its skills under a workspace directory, so the generic probe sweeps a
+    // directory a pull never wrote to and leaves the real one untouched (#624).
+    const skillsDir = await skillsDirForTool(tool, toolPath.skills, localConfig);
+    if (skillsDir === null) continue;
+    if (!await pathExists(skillsDir)) continue;
 
-    const localSkillNames = await listDirs(path.join(baseDir, toolPath.skills));
+    const localSkillNames = await listDirs(skillsDir);
     for (const skillName of localSkillNames) {
       if (BUILTIN_SKILL_NAMES.has(skillName)) continue;
       if (retainedSkillNames.has(skillName)) continue;
       if (!inactiveSkillNames.has(skillName)) continue;
 
-      const localSkillDir = path.join(baseDir, toolPath.skills, skillName);
+      const localSkillDir = path.join(skillsDir, skillName);
 
       // Data-safety guard: only delete a deployed skill when it is byte-identical
       // to its team-repo source. If the user modified SKILL.md or added unpushed
@@ -759,9 +802,6 @@ async function pullForScope(
     }
   }
 
-  // Load tags config for filtering
-  const tagsConfig = await loadTagsConfig(localConfig.repo.localPath);
-  const subscribedTags = localConfig.subscribedTags;
   const excludedSkills = new Set(localConfig.excludedSkills ?? []);
 
   // Step 2: Sync each resource type
@@ -778,14 +818,10 @@ async function pullForScope(
 
     if (type === 'rules') {
       const rulesHandler = handler as RulesHandler;
-      const allItems = await rulesHandler.scanTeamForPull(freshConfig, localConfig);
-      // Filter by role knowledge namespaces first, then by tags
-      const knowledgeNs = roleContext ? roleContext.activeNamespaces.knowledge : null;
-      const roleFiltered = filterRulesByKnowledgeNamespaces(allItems, knowledgeNs);
-      const { included: items, skipped } = filterByTags(roleFiltered, tagsConfig, subscribedTags, 'rules');
+      const { items, skippedByTags } = await resolveDesiredRules(freshConfig, localConfig, roleContext);
       if (options.dryRun) {
         if (items.length > 0) {
-          log.info(`[${scopeLabel}] [dry-run] Would sync ${items.length} rule(s)${skipped.length > 0 ? ` (skipped ${skipped.length} by tags)` : ''}`);
+          log.info(`[${scopeLabel}] [dry-run] Would sync ${items.length} rule(s)${skippedByTags > 0 ? ` (skipped ${skippedByTags} by tags)` : ''}`);
         }
       } else {
         // Always call pullAllRules, even with an empty set: it also cleans up
@@ -794,7 +830,7 @@ async function pullForScope(
         // would leak those artifacts on the machine after upstream deletion.
         await rulesHandler.pullAllRules(freshConfig, localConfig, items);
         if (items.length > 0) {
-          log.success(`[${scopeLabel}] Synced ${items.length} rule(s)${skipped.length > 0 ? ` (skipped ${skipped.length} by tags)` : ''}`);
+          log.success(`[${scopeLabel}] Synced ${items.length} rule(s)${skippedByTags > 0 ? ` (skipped ${skippedByTags} by tags)` : ''}`);
         }
       }
       totalSynced += items.length;
@@ -812,12 +848,9 @@ async function pullForScope(
       knownRepoSkillNames = new Set(desired.teamItems.map((i) => i.name));
       knownRepoSkillSources = new Map(desired.teamItems.map((i) => [i.name, i.sourcePath]));
     } else if (type === 'agents') {
-      // Role/project namespace filter (root = everyone), same as rules. Throws
-      // on a stem collision; the caller's try/catch logs it and aborts the scope.
-      items = filterAgentsByNamespaces(
-        await handler.scanTeamForPull(freshConfig, localConfig),
-        roleContext ? roleContext.activeNamespaces.agents : null,
-      );
+      // Throws on a stem collision; the caller's try/catch logs it and aborts
+      // the scope.
+      items = await resolveDesiredAgents(freshConfig, localConfig, roleContext);
     } else {
       items = await handler.scanTeamForPull(freshConfig, localConfig);
     }
@@ -1935,10 +1968,12 @@ async function reportPostPullChecks(
 
     // The budget covers building the registry as well as running it: the
     // delivery checks stat every desired skill for every tool while the
-    // registry is built, which is where the I/O actually is.
+    // registry is built, which is where the I/O actually is. The `'pull'`
+    // stage leaves out the two that would spend it — rules read every file per
+    // tool, agents parse every spec — so the cheap ones still get to run.
     const results = await withTimeout(
       (async () => {
-        const local = (await buildChecks(ctx))
+        const local = (await buildChecks(ctx, 'pull'))
           .filter((c) => c.source === 'local')
           .filter((c) => !c.reportedByPull || !reported.has(c.reportedByPull));
         return runChecks(local);

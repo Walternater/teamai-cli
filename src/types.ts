@@ -630,6 +630,19 @@ export interface ResourceDiff {
   removed: ResourceItem[];
 }
 
+/** Where one item lands for one tool. See `ResourceHandler.deliveryTargets`. */
+export interface DeliveryTarget {
+  tool: string;
+  dest: string;
+  /**
+   * The exact bytes `pullItem` writes at `dest`, for a handler that renders
+   * its destination rather than copying a tree there. It is what tells a copy
+   * rendered from an older spec from the current one; absent means the handler
+   * cannot say, and only the destination's existence can be judged.
+   */
+  content?: string;
+}
+
 // ─── Hook definitions (unified model, issue #19) ─────────
 //
 //  A single declarative model for both built-in operational hooks (source:

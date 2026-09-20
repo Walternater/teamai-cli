@@ -23,6 +23,11 @@ const EnvYamlSchema = z.object({
 export type EnvVariable = z.infer<typeof EnvVariableSchema>;
 export type EnvYaml = z.infer<typeof EnvYamlSchema>;
 
+/** A parsed env.yaml, or the reason it declares nothing. See `readEnvYaml`. */
+export type EnvYamlRead =
+  | { ok: true; variables: EnvVariable[] }
+  | { ok: false; reason: string };
+
 /**
  * Mask an env variable value for display.
  * Shows first 2 chars + "****", or "****" for very short values.
@@ -40,6 +45,58 @@ export function maskEnvValue(value: string): string {
  */
 function shellQuoteValue(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * Read back the assignments `generateEnvFile` writes, as key → value.
+ *
+ * The inverse of the generator, and it has to be: a YAML block scalar is a
+ * legal env value, and single-quoting one spans several physical lines. A
+ * reader that splits env.sh on newlines can never match such an export, so it
+ * reports a correctly delivered value as stale (#624 review). Lines that are
+ * not an `export KEY='...'` we wrote are skipped rather than guessed at.
+ */
+export function parseEnvFile(content: string): Map<string, string> {
+  const PREFIX = 'export ';
+  const KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+  const assignments = new Map<string, string>();
+
+  let i = 0;
+  while (i < content.length) {
+    const eq = content.startsWith(PREFIX, i) ? content.indexOf('=', i + PREFIX.length) : -1;
+    const key = eq === -1 ? '' : content.slice(i + PREFIX.length, eq);
+    if (eq === -1 || !KEY.test(key) || content[eq + 1] !== "'") {
+      const nl = content.indexOf('\n', i);
+      if (nl === -1) break;
+      i = nl + 1;
+      continue;
+    }
+
+    let j = eq + 2;
+    let value = '';
+    let closed = false;
+    while (j < content.length) {
+      if (content[j] !== "'") {
+        value += content[j];
+        j++;
+      } else if (content.startsWith("'\\''", j)) {
+        // The generator's encoding of a literal quote: close, escape, reopen.
+        value += "'";
+        j += 4;
+      } else {
+        closed = true;
+        j++;
+        break;
+      }
+    }
+    // An unterminated quote means the rest of the file is not ours to read.
+    if (!closed) break;
+
+    assignments.set(key, value);
+    i = content[j] === '\n' ? j + 1 : j;
+  }
+
+  return assignments;
 }
 
 // ─── Handler ─────────────────────────────────────────────
@@ -198,15 +255,45 @@ export class EnvHandler extends ResourceHandler {
    * Parse the env.yaml file and return variables.
    */
   async parseEnvYaml(filePath: string): Promise<EnvYaml> {
-    const content = await readFileSafe(filePath);
-    if (!content) return { variables: [] };
+    const read = await this.readEnvYaml(filePath);
+    return { variables: read.ok ? read.variables : [] };
+  }
 
+  /**
+   * Parse env/env.yaml, keeping the reason a file yielded no variables.
+   *
+   * `parseEnvYaml` answers `[]` to four different files: absent, empty,
+   * `variables: []`, and a shorthand `KEY: value` mapping whose unknown
+   * top-level key zod drops (#662). Only the last is broken, so a caller that
+   * reports on the count alone either misses the bug or calls a deliberately
+   * empty configuration malformed (#624 review).
+   */
+  async readEnvYaml(filePath: string): Promise<EnvYamlRead> {
+    const content = await readFileSafe(filePath);
+    if (content === null) return { ok: true, variables: [] };
+
+    let raw: unknown;
     try {
-      const raw = YAML.parse(content);
-      return EnvYamlSchema.parse(raw);
-    } catch {
-      return { variables: [] };
+      raw = YAML.parse(content);
+    } catch (e) {
+      return { ok: false, reason: `${filePath} is not valid YAML: ${(e as Error).message}` };
     }
+    // An empty document is a file with nothing to deliver, not a broken one.
+    if (raw === null || raw === undefined) return { ok: true, variables: [] };
+
+    if (typeof raw !== 'object' || Array.isArray(raw) || !('variables' in raw)) {
+      return {
+        ok: false,
+        reason: `${filePath} declares no variables. Its top-level key must be \`variables:\`, a list `
+          + 'of `key`/`value` entries — a plain `KEY: value` mapping parses as an empty list',
+      };
+    }
+
+    const parsed = EnvYamlSchema.safeParse(raw);
+    if (!parsed.success) {
+      return { ok: false, reason: `${filePath} does not match the env.yaml schema: ${parsed.error.message}` };
+    }
+    return { ok: true, variables: parsed.data.variables };
   }
 
   /**
@@ -246,8 +333,12 @@ export class EnvHandler extends ResourceHandler {
 
   /**
    * Detect the user's shell profile path.
+   *
+   * Public because `doctor` has to check the same file the injection writes:
+   * a second spelling of this choice would check `.bashrc` while the pull
+   * wrote `.zshrc`, and report a correct install as broken.
    */
-  private detectShellProfile(): string {
+  detectShellProfile(): string {
     const home = getUserHome();
     const shell = process.env.SHELL ?? '';
 
