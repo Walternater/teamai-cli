@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
 import YAML from 'yaml';
-import { EnvHandler } from '../resources/env.js';
+import { EnvHandler, describeEnvYamlShapeProblem } from '../resources/env.js';
 import { TEAMAI_ENV_START, TEAMAI_ENV_END } from '../types.js';
 import type { TeamaiConfig, LocalConfig, ResourceItem } from '../types.js';
 
@@ -145,6 +145,41 @@ scope: 'user',
   });
 
   // ─── writeEnvYaml ────────────────────────────────────────
+
+  // ─── describeEnvYamlShapeProblem ─────────────────────────
+
+  describe('describeEnvYamlShapeProblem', () => {
+    it('reports a mapping with no variables key but other top-level keys', () => {
+      const warning = describeEnvYamlShapeProblem({ FOO: 'bar', BAZ: 'qux' });
+
+      expect(warning).toContain('no top-level `variables:` key');
+      expect(warning).toContain('`FOO`');
+      expect(warning).toContain('`BAZ`');
+      expect(warning).toContain('`key`/`value`');
+    });
+
+    it('stays silent for a valid variables list', () => {
+      expect(describeEnvYamlShapeProblem({ variables: [{ key: 'A', value: 'b' }] })).toBeNull();
+    });
+
+    it('stays silent when an extra top-level key rides along with variables', () => {
+      // Must stay permissive: a team repo already shipping this shape has to
+      // keep delivering rather than start failing to parse.
+      expect(describeEnvYamlShapeProblem({ variables: [], extra: true })).toBeNull();
+    });
+
+    it('stays silent for an empty or absent mapping', () => {
+      expect(describeEnvYamlShapeProblem({})).toBeNull();
+      expect(describeEnvYamlShapeProblem(null)).toBeNull();
+      expect(describeEnvYamlShapeProblem(undefined)).toBeNull();
+    });
+
+    it('stays silent for documents that are not mappings', () => {
+      expect(describeEnvYamlShapeProblem([])).toBeNull();
+      expect(describeEnvYamlShapeProblem('FOO=bar')).toBeNull();
+      expect(describeEnvYamlShapeProblem(42)).toBeNull();
+    });
+  });
 
   describe('writeEnvYaml', () => {
     it('should write env.yaml correctly', async () => {
@@ -481,6 +516,41 @@ scope: 'user',
       // Should not crash and should not modify shell profile
       const content = await fse.readFile(bashrcPath, 'utf-8');
       expect(content).toBe('# original\n');
+    });
+
+    it('reports the missing `variables:` key from a real env.yaml file', async () => {
+      // The shape zod used to swallow: a bare key/value mapping. The file
+      // parses cleanly, so the pull looked successful while nothing shipped
+      // (#662). `pullForScope` reads it through this method, because it skips
+      // the resource before `pullItem` — where the check used to live — runs.
+      const shapeYamlPath = path.join(repoPath, 'env', 'shape.yaml');
+      await fse.writeFile(shapeYamlPath, 'FOO: bar\nBAZ: qux\n');
+
+      const problem = await handler.describeEnvYamlShapeProblemAt(shapeYamlPath);
+
+      expect(problem).toContain('no top-level `variables:` key');
+      expect(problem).toContain('`FOO`');
+      expect(problem).toContain('`BAZ`');
+    });
+
+    it('reports nothing for a usable, empty, malformed or missing env.yaml', async () => {
+      const okPath = path.join(repoPath, 'env', 'ok.yaml');
+      await fse.writeFile(okPath, YAML.stringify({ variables: [{ key: 'A', value: 'b' }] }));
+      expect(await handler.describeEnvYamlShapeProblemAt(okPath)).toBeNull();
+
+      const emptyPath = path.join(repoPath, 'env', 'empty.yaml');
+      await fse.writeFile(emptyPath, YAML.stringify({ variables: [] }));
+      expect(await handler.describeEnvYamlShapeProblemAt(emptyPath)).toBeNull();
+
+      // Malformed YAML is a separate failure and must not be dressed up as a
+      // shape problem.
+      const brokenPath = path.join(repoPath, 'env', 'broken.yaml');
+      await fse.writeFile(brokenPath, 'variables: [unclosed\n');
+      expect(await handler.describeEnvYamlShapeProblemAt(brokenPath)).toBeNull();
+
+      expect(
+        await handler.describeEnvYamlShapeProblemAt(path.join(repoPath, 'env', 'absent.yaml')),
+      ).toBeNull();
     });
   });
 
