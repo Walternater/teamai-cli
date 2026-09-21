@@ -6,7 +6,11 @@ import type { ResourceItem, TeamaiConfig, LocalConfig } from '../types.js';
 import { TEAMAI_ENV_START, TEAMAI_ENV_END, getDataHome, getEnvBackupPath, isSelfMode } from '../types.js';
 import { pathExists, readFileSafe, writeFile, ensureDir, fileContentEqual } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
-import { getUserHome } from '../utils/home.js';
+import {
+  resolveActiveShellProfile,
+  shellQuoteValue,
+  isWindowsFormPath,
+} from '../utils/shell-profile.js';
 
 // ─── Schema for env.yaml ────────────────────────────────
 
@@ -75,28 +79,6 @@ export function describeEnvYamlShapeProblem(raw: unknown): string | null {
 export function maskEnvValue(value: string): string {
   if (value.length < 4) return '****';
   return `${value.slice(0, 2)}****`;
-}
-
-/**
- * Quote a string so it is safe to interpolate into a POSIX shell (bash/zsh/sh).
- * Wraps the value in single quotes and encodes any embedded single quote as
- * `'\''`, leaving all other characters (including `"`, `$`, `` ` ``, `\`)
- * literal. Used when generating env.sh, which every team member sources.
- */
-function shellQuoteValue(value: string): string {
-  return `'${value.replace(/'/g, "'\\''")}'`;
-}
-
-/**
- * True for a path a shell must read the Windows way: a drive-letter path
- * (`C:\...` or `C:/...`) or a UNC path (`\\server\share`).
- *
- * A POSIX path is deliberately excluded: there a backslash is an ordinary
- * filename character, not a separator, so collapsing every one of them would
- * silently point the shell at a different directory.
- */
-function isWindowsFormPath(value: string): boolean {
-  return /^[A-Za-z]:[\\/]/.test(value) || value.startsWith('\\\\');
 }
 
 /**
@@ -280,7 +262,7 @@ export class EnvHandler extends ResourceHandler {
     if (inject) {
       const profilePath = teamConfig.sharing.env.shellProfilePath
         ? teamConfig.sharing.env.shellProfilePath
-        : this.detectShellProfile();
+        : await this.detectShellProfile(path.join(teamaiHome, 'env.sh'));
 
       const shellBlock = this.generateShellBlock(teamaiHome);
       await this.injectShellProfile(profilePath, shellBlock);
@@ -430,16 +412,14 @@ export class EnvHandler extends ResourceHandler {
    *
    * Public because `doctor` has to check the same file the injection writes:
    * a second spelling of this choice would check `.bashrc` while the pull
-   * wrote `.zshrc`, and report a correct install as broken.
+   * wrote `.zshrc`, and report a correct install as broken. Delegates to the
+   * shared `utils/shell-profile.js` so `teamai uninstall` resolves the same
+   * file too (#682), and stays on whichever candidate already carries this
+   * scope's block rather than re-deriving it from scratch every pull (#693
+   * review round 7).
    */
-  detectShellProfile(): string {
-    const home = getUserHome();
-    const shell = process.env.SHELL ?? '';
-
-    if (shell.includes('zsh')) {
-      return path.join(home, '.zshrc');
-    }
-    return path.join(home, '.bashrc');
+  detectShellProfile(envShPath: string, platform: NodeJS.Platform = process.platform): Promise<string> {
+    return resolveActiveShellProfile(envShPath, platform);
   }
 
   /**

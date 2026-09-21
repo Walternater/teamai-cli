@@ -156,14 +156,17 @@ async function setupFixture(tmpDir: string) {
   ].join('\n');
   await fse.writeFile(path.join(homeDir, '.claude', 'CLAUDE.md'), claudeMd);
 
-  // Shell profile with env block
+  // Shell profile with env block. The source line points at this scope's own
+  // env.sh (not a `~` shorthand) since uninstall now only cleans a block that
+  // sources the current scope's data home (#693 review).
+  const envShPosix = path.join(homeDir, '.teamai', 'env.sh').split(path.sep).join('/');
   const zshrc = [
     '# My zshrc config',
     'export PATH=$HOME/bin:$PATH',
     '',
     TEAMAI_ENV_START,
     '# DO NOT EDIT',
-    '[ -f ~/.teamai/env.sh ] && source ~/.teamai/env.sh',
+    `[ -f '${envShPosix}' ] && source '${envShPosix}'`,
     TEAMAI_ENV_END,
     '',
     '# More user config',
@@ -191,10 +194,16 @@ describe('uninstall', () => {
     mockReconcileHooks.mockReset();
     mockSaveLocalConfig.mockReset();
     mockSaveLocalConfigForScope.mockReset();
+    // These tests exercise the SHELL-based POSIX branch of detectShellProfile
+    // via stubbed SHELL values; pin the platform so they assert the same
+    // thing on a Windows dev machine as they do in CI (ubuntu/macos). The
+    // win32 branch has its own tests in shell-profile.test.ts.
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
   });
 
   afterEach(async () => {
     vi.unstubAllEnvs();
+    vi.restoreAllMocks();
     await fse.remove(tmpDir);
   });
 
@@ -245,6 +254,143 @@ describe('uninstall', () => {
 
     // ~/.teamai/ removed
     expect(await fse.pathExists(teamaiHome)).toBe(false);
+  });
+
+  // Regression (#693 review): the Windows fix in #682 changed which profile
+  // file `pull` prefers, so a machine last pulled with an older CLI can carry
+  // a stale env block in a file the current detectShellProfile() resolution
+  // no longer points at (a fresh pull then adds a second block elsewhere).
+  // uninstall must find and clean every such file, not only the current one.
+  it('cleans a stale env block left in an old profile file alongside the current one', async () => {
+    const { homeDir, repoPath, teamaiHome } = await setupFixture(tmpDir);
+    vi.stubEnv('HOME', homeDir);
+    vi.stubEnv('SHELL', '');
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+
+    // Both blocks source THIS scope's own env.sh — only their file location
+    // differs, exactly like an upgrade across #682 would leave things.
+    const envShPosix = path.join(homeDir, '.teamai', 'env.sh').split(path.sep).join('/');
+
+    // Stale block: what an older CLI wrote to .bashrc before #682.
+    const staleBashrc = [
+      '# my bashrc',
+      TEAMAI_ENV_START,
+      '# DO NOT EDIT',
+      `[ -f '${envShPosix}' ] && source '${envShPosix}'`,
+      TEAMAI_ENV_END,
+    ].join('\n');
+    await fse.writeFile(path.join(homeDir, '.bashrc'), staleBashrc);
+
+    // Current block: what the fixed CLI writes to .profile today.
+    const currentProfile = [
+      '# my profile',
+      TEAMAI_ENV_START,
+      '# DO NOT EDIT',
+      `[ -f '${envShPosix}' ] && source '${envShPosix}'`,
+      TEAMAI_ENV_END,
+    ].join('\n');
+    await fse.writeFile(path.join(homeDir, '.profile'), currentProfile);
+
+    const teamConfig = makeTeamConfig({
+      sharing: {
+        skills: {},
+        rules: { enforced: [] },
+        docs: { localDir: `${teamaiHome}/docs` },
+        env: { injectShellProfile: true },
+      },
+    });
+    const localConfig = makeLocalConfig(homeDir, repoPath);
+    mockAutoDetectInit.mockResolvedValue({ localConfig, teamConfig });
+
+    await uninstall({ force: true });
+
+    const bashrc = await fse.readFile(path.join(homeDir, '.bashrc'), 'utf-8');
+    expect(bashrc).toContain('# my bashrc');
+    expect(bashrc).not.toContain(TEAMAI_ENV_START);
+
+    const profile = await fse.readFile(path.join(homeDir, '.profile'), 'utf-8');
+    expect(profile).toContain('# my profile');
+    expect(profile).not.toContain(TEAMAI_ENV_START);
+  });
+
+  // Regression (#693 review): scanning every candidate filename must not
+  // delete a DIFFERENT scope's still-active block just because it also
+  // happens to carry the teamai marker — only a block sourcing THIS scope's
+  // own env.sh may be touched.
+  it('leaves another scope\'s env block untouched even though it shares a candidate filename', async () => {
+    const { homeDir, repoPath, teamaiHome } = await setupFixture(tmpDir);
+    vi.stubEnv('HOME', homeDir);
+    vi.stubEnv('SHELL', '');
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+
+    // A project scope's block, unrelated to the user-scope uninstall below.
+    const otherProjectEnvSh = path.join(tmpDir, 'other-project', '.teamai', 'env.sh')
+      .split(path.sep).join('/');
+    const bashrc = [
+      '# my bashrc',
+      TEAMAI_ENV_START,
+      '# DO NOT EDIT',
+      `[ -f '${otherProjectEnvSh}' ] && source '${otherProjectEnvSh}'`,
+      TEAMAI_ENV_END,
+    ].join('\n');
+    await fse.writeFile(path.join(homeDir, '.bashrc'), bashrc);
+
+    const teamConfig = makeTeamConfig({
+      sharing: {
+        skills: {},
+        rules: { enforced: [] },
+        docs: { localDir: `${teamaiHome}/docs` },
+        env: { injectShellProfile: true },
+      },
+    });
+    const localConfig = makeLocalConfig(homeDir, repoPath); // scope: 'user'
+    mockAutoDetectInit.mockResolvedValue({ localConfig, teamConfig });
+
+    await uninstall({ force: true });
+
+    // The unrelated project-scope block must survive intact.
+    const bashrcAfter = await fse.readFile(path.join(homeDir, '.bashrc'), 'utf-8');
+    expect(bashrcAfter).toBe(bashrc);
+  });
+
+  // Regression (#693 hardware review by @CarlosWonMore): a pre-#661 CLI wrote
+  // the source path raw and unquoted, with unconverted backslashes. That
+  // block is broken (a POSIX shell never loads it) but still names this
+  // scope's own env.sh, and uninstall must still find and remove it — not
+  // just blocks written in the current quoted/forward-slash format.
+  it('cleans a pre-#661 legacy block (raw, unquoted, unconverted backslashes)', async () => {
+    const { homeDir, repoPath, teamaiHome } = await setupFixture(tmpDir);
+    vi.stubEnv('HOME', homeDir);
+    vi.stubEnv('SHELL', '');
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+
+    const envShWindows = path.join(homeDir, '.teamai', 'env.sh');
+    const legacyBashrc = [
+      '# my bashrc',
+      TEAMAI_ENV_START,
+      '# DO NOT EDIT',
+      `[ -f ${envShWindows} ] && source ${envShWindows}`,
+      TEAMAI_ENV_END,
+    ].join('\n');
+    await fse.writeFile(path.join(homeDir, '.bashrc'), legacyBashrc);
+    await fse.writeFile(path.join(homeDir, '.profile'), '# my profile');
+
+    const teamConfig = makeTeamConfig({
+      sharing: {
+        skills: {},
+        rules: { enforced: [] },
+        docs: { localDir: `${teamaiHome}/docs` },
+        env: { injectShellProfile: true },
+      },
+    });
+    const localConfig = makeLocalConfig(homeDir, repoPath);
+    mockAutoDetectInit.mockResolvedValue({ localConfig, teamConfig });
+
+    await uninstall({ force: true });
+
+    const bashrcAfter = await fse.readFile(path.join(homeDir, '.bashrc'), 'utf-8');
+    expect(bashrcAfter).toContain('# my bashrc');
+    expect(bashrcAfter).not.toContain(TEAMAI_ENV_START);
   });
 
   // Regression: Cursor rules are `.mdc`; matching only `.md` left every team

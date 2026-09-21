@@ -53,6 +53,12 @@ import {
 import { log } from './utils/logger.js';
 import { askConfirmation } from './utils/prompt.js';
 import { getUserHome } from './utils/home.js';
+import {
+  detectShellProfile,
+  extractEnvBlock,
+  envBlockReferencesDataHome,
+  SHELL_PROFILE_CANDIDATE_NAMES,
+} from './utils/shell-profile.js';
 
 // ─── Types ─────────────────────────────────────────────
 
@@ -81,8 +87,8 @@ interface RemovalPlan {
   agentFiles: string[];
   /** teamai-managed MCP servers from managed-mcp.json (`tool/server` or `tool:project/server`). */
   mcpServers: string[];
-  /** Shell profile path containing env block (null if none). */
-  shellProfile: string | null;
+  /** Shell profile paths carrying a teamai env block (usually one, but see #682/#693). */
+  shellProfiles: string[];
   /** Docs directory (null if doesn't exist). */
   docsDir: string | null;
   /** The .teamai home directory path. */
@@ -130,15 +136,6 @@ const CLAUDEMD_MARKER_PAIRS: Array<[string, string]> = [
   [TEAMAI_CLAUDEMD_START, TEAMAI_CLAUDEMD_END],
   [TEAMAI_RECALL_RULES_START, TEAMAI_RECALL_RULES_END],
 ];
-
-function detectShellProfile(): string {
-  const home = getUserHome();
-  const shell = process.env.SHELL ?? '';
-  if (shell.includes('zsh')) {
-    return path.join(home, '.zshrc');
-  }
-  return path.join(home, '.bashrc');
-}
 
 /**
  * Collect team repo skill names, handling both flat and namespaced layouts.
@@ -476,7 +473,7 @@ async function buildRemovalPlan(
     ruleFiles: [],
     agentFiles: [],
     mcpServers: [],
-    shellProfile: null,
+    shellProfiles: [],
     docsDir: null,
     teamaiHome,
     teamaiHomeExists: includeShared && await pathExists(teamaiHome),
@@ -517,14 +514,35 @@ async function buildRemovalPlan(
     }
     plan.mcpServers.sort();
 
-    // (e) Shell profile env block
-    const shellProfilePath = teamConfig.sharing.env.shellProfilePath
+    // (e) Shell profile env block(s). Scan every profile file teamai could
+    // ever have written to, not just the one detectShellProfile() resolves to
+    // today: the Windows fix (#682) changed which file `pull` prefers, so a
+    // machine last pulled with an older CLI can carry a stale block in a file
+    // the current resolution no longer points at, and a plain uninstall would
+    // silently leave that managed block behind.
+    //
+    // A candidate only counts if its block actually names THIS scope's
+    // env.sh (envBlockReferencesDataHome) — matching on the marker alone
+    // would let this uninstall delete a different scope's still-active block
+    // just because it also happens to live in one of the candidate
+    // filenames. This check is deliberately looser than doctor's "does it
+    // load" check: a legacy block written by a pre-#661/#682 CLI (raw
+    // backslashes, or the MSYS drive form) still belongs to this scope and
+    // still has to be found and removed, even though it never worked.
+    const configuredProfilePath = teamConfig.sharing.env.shellProfilePath
       ? expandHome(teamConfig.sharing.env.shellProfilePath)
-      : detectShellProfile();
-    if (shellProfilePath) {
-      const profileContent = await readFileSafe(shellProfilePath);
-      if (profileContent && profileContent.includes(TEAMAI_ENV_START)) {
-        plan.shellProfile = shellProfilePath;
+      : await detectShellProfile();
+    const home = getUserHome();
+    const envShPath = path.join(getDataHome(localConfig), 'env.sh');
+    const candidateProfilePaths = Array.from(new Set([
+      configuredProfilePath,
+      ...SHELL_PROFILE_CANDIDATE_NAMES.map((name) => path.join(home, name)),
+    ]));
+    for (const candidate of candidateProfilePaths) {
+      const profileContent = await readFileSafe(candidate);
+      const block = profileContent ? extractEnvBlock(profileContent) : null;
+      if (block && envBlockReferencesDataHome(block, envShPath)) {
+        plan.shellProfiles.push(candidate);
       }
     }
 
@@ -551,7 +569,7 @@ function isPlanEmpty(plan: RemovalPlan): boolean {
     plan.ruleFiles.length === 0 &&
     plan.agentFiles.length === 0 &&
     plan.mcpServers.length === 0 &&
-    plan.shellProfile === null &&
+    plan.shellProfiles.length === 0 &&
     plan.docsDir === null &&
     !plan.teamaiHomeExists
   );
@@ -637,9 +655,11 @@ function printSummary(plan: RemovalPlan, agentFilter?: string): void {
     console.log('');
   }
 
-  if (plan.shellProfile) {
-    console.log('   Shell profile env block:');
-    console.log(`     ${plan.shellProfile}`);
+  if (plan.shellProfiles.length > 0) {
+    console.log(`   Shell profile env blocks (${plan.shellProfiles.length}):`);
+    for (const profilePath of plan.shellProfiles) {
+      console.log(`     ${profilePath}`);
+    }
     console.log('');
   }
 
@@ -795,22 +815,23 @@ async function executeRemoval(plan: RemovalPlan): Promise<void> {
     log.success(`Removed ${plan.agentFiles.length} agent files`);
   }
 
-  // (e) Clean shell profile env block
-  if (plan.shellProfile) {
+  // (e) Clean shell profile env block(s) — every file discovered in
+  // buildRemovalPlan, not just the one detectShellProfile() resolves to today.
+  for (const profilePath of plan.shellProfiles) {
     try {
-      const content = await readFileSafe(plan.shellProfile);
+      const content = await readFileSafe(profilePath);
       if (content) {
         const startIdx = content.indexOf(TEAMAI_ENV_START);
         const endIdx = content.indexOf(TEAMAI_ENV_END);
         if (startIdx !== -1 && endIdx !== -1) {
           const before = content.substring(0, startIdx).replace(/\n+$/, '\n');
           const after = content.substring(endIdx + TEAMAI_ENV_END.length).replace(/^\n+/, '\n');
-          await writeFile(plan.shellProfile, before + after);
-          log.success(`Cleaned shell profile: ${plan.shellProfile}`);
+          await writeFile(profilePath, before + after);
+          log.success(`Cleaned shell profile: ${profilePath}`);
         }
       }
     } catch (e) {
-      log.warn(`Failed to clean shell profile: ${(e as Error).message}`);
+      log.warn(`Failed to clean shell profile ${profilePath}: ${(e as Error).message}`);
     }
   }
 
