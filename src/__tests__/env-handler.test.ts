@@ -18,6 +18,23 @@ vi.mock('../utils/logger.js', () => ({
   },
 }));
 
+/**
+ * The source line `generateShellBlock` must emit for a given teamai home.
+ *
+ * Built by mirroring the production transform rather than hard-coding a
+ * separator: the real path is machine-dependent (`C:\Users\...` on Windows,
+ * `/home/...` elsewhere) and the block is asserted from CI runners that are
+ * never Windows, so the expectation has to normalise the same way the source
+ * does. Only Windows-form paths are rewritten — a POSIX home keeps its
+ * backslashes, which are filename characters there, not separators.
+ */
+const expectedSourceLine = (teamaiHome: string): string => {
+  const isWindowsForm = /^[A-Za-z]:[\\/]/.test(teamaiHome) || teamaiHome.startsWith('\\\\');
+  const shellHome = isWindowsForm ? teamaiHome.replace(/\\/g, '/') : teamaiHome;
+  const envShPath = `'${shellHome}/env.sh'`;
+  return `[ -f ${envShPath} ] && source ${envShPath}`;
+};
+
 describe('EnvHandler', () => {
   let handler: EnvHandler;
   let tmpDir: string;
@@ -187,14 +204,45 @@ scope: 'user',
 
   describe('generateShellBlock', () => {
     it('should generate source line block with markers', () => {
-      const block = handler.generateShellBlock('~/.teamai');
+      const block = handler.generateShellBlock('/home/dev/.teamai');
 
       expect(block).toContain(TEAMAI_ENV_START);
       expect(block).toContain(TEAMAI_ENV_END);
       expect(block).toContain('# DO NOT EDIT: This section is auto-managed by teamai');
-      expect(block).toContain('[ -f ~/.teamai/env.sh ] && source ~/.teamai/env.sh');
+      expect(block).toContain(expectedSourceLine('/home/dev/.teamai'));
       // Should NOT contain inline export lines
       expect(block).not.toMatch(/^export /m);
+    });
+
+    it('normalises a Windows path so the block still loads from a POSIX shell', () => {
+      // Even on Windows the block is read back by bash/zsh, where the native
+      // form `C:\Users\me\.teamai` is an escape-laden string: `[ -f ... ]`
+      // fails and `source` never runs, with nothing reporting it (#661).
+      const block = handler.generateShellBlock('C:\\Users\\me\\.teamai');
+
+      expect(block).toContain(
+        "[ -f 'C:/Users/me/.teamai/env.sh' ] && source 'C:/Users/me/.teamai/env.sh'",
+      );
+    });
+
+    it('leaves a backslash in a POSIX home alone', () => {
+      // On POSIX a backslash is an ordinary filename character; collapsing it
+      // would point the block at a different directory (bot review on #680).
+      const block = handler.generateShellBlock('/home/a\\b/.teamai');
+
+      expect(block).toContain(expectedSourceLine('/home/a\\b/.teamai'));
+      expect(block).toContain(
+        "[ -f '/home/a\\b/.teamai/env.sh' ] && source '/home/a\\b/.teamai/env.sh'",
+      );
+    });
+
+    it('quotes the path so a home directory containing a space cannot break the block', () => {
+      const block = handler.generateShellBlock('C:\\Users\\John Doe\\.teamai');
+
+      expect(block).toContain(expectedSourceLine('C:\\Users\\John Doe\\.teamai'));
+      expect(block).toContain(
+        "[ -f 'C:/Users/John Doe/.teamai/env.sh' ] && source 'C:/Users/John Doe/.teamai/env.sh'",
+      );
     });
   });
 
@@ -287,7 +335,7 @@ scope: 'user',
       const content = await fse.readFile(bashrcPath, 'utf-8');
       expect(content).toContain('# existing config');
       expect(content).toContain(TEAMAI_ENV_START);
-      expect(content).toContain(`[ -f ${homeDir}/.teamai/env.sh ] && source ${homeDir}/.teamai/env.sh`);
+      expect(content).toContain(expectedSourceLine(`${homeDir}/.teamai`));
       expect(content).toContain(TEAMAI_ENV_END);
       // Should NOT have inline export lines in the profile
       expect(content).not.toContain('export TGIT_API_BASE');
@@ -302,7 +350,7 @@ scope: 'user',
 
       const content = await fse.readFile(zshrcPath, 'utf-8');
       expect(content).toContain(TEAMAI_ENV_START);
-      expect(content).toContain(`[ -f ${homeDir}/.teamai/env.sh ] && source ${homeDir}/.teamai/env.sh`);
+      expect(content).toContain(expectedSourceLine(`${homeDir}/.teamai`));
     });
 
     it('should idempotently replace existing block (including old-style with exports)', async () => {
@@ -326,7 +374,7 @@ scope: 'user',
       // Old inline export should be gone
       expect(content).not.toContain('OLD_VAR');
       // Source line should be present instead
-      expect(content).toContain(`[ -f ${homeDir}/.teamai/env.sh ] && source ${homeDir}/.teamai/env.sh`);
+      expect(content).toContain(expectedSourceLine(`${homeDir}/.teamai`));
       expect(content).toContain('# my config');
       expect(content).toContain('# other config');
       // Only one start/end pair
@@ -389,7 +437,7 @@ scope: 'user',
 
       const content = await fse.readFile(customPath, 'utf-8');
       expect(content).toContain(TEAMAI_ENV_START);
-      expect(content).toContain(`[ -f ${homeDir}/.teamai/env.sh ] && source ${homeDir}/.teamai/env.sh`);
+      expect(content).toContain(expectedSourceLine(`${homeDir}/.teamai`));
     });
 
     it('should skip when env.yaml has no variables', async () => {
