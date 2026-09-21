@@ -1210,12 +1210,17 @@ export async function parseHookEvent(
   if (eventType === 'prompt_submit' && typeof hookData.prompt === 'string') {
     const human = stripInjectedPrompt(hookData.prompt);
     if (!human) return null;
-    // Keep first 200 chars of the genuine prompt as summary.
-    if (!isCopilot) event.promptSummary = human.slice(0, 200);
     // Decide "correction" here, over the full prompt, because only the hook knows
     // which team (and so which extra keywords) the prompt belongs to. The
-    // machine-level events file mixes sessions from every team.
+    // machine-level events file mixes sessions from every team. Do this before
+    // dropping the original prompt so keywords beyond the persisted summary are
+    // still detected.
     event.correction = isCorrectionPrompt(human, options?.correctionKeywords);
+    // Persist only a redacted, capped summary. Redact before truncating so a
+    // secret that crosses the 200-character boundary cannot be partially leaked.
+    // Copilot prompts remain entirely absent from telemetry, matching its
+    // provider-specific privacy contract while retaining the correction signal.
+    if (!isCopilot) event.promptSummary = redactWithEnv(human).slice(0, 200);
   }
 
   // Extract transcript path, AI output and intervention counts from Stop event
@@ -1487,7 +1492,7 @@ export async function appendEvent(event: DashboardEvent): Promise<void> {
     const detail = event.toolName
       ? ` [tool=${event.toolName}]`
       : event.promptSummary
-        ? ` [prompt=${event.promptSummary.slice(0, 60)}]`
+        ? ` [prompt=${event.promptSummary}]`
         : '';
     log.debug(`dashboard: recorded ${event.type} for session ${event.sessionId.slice(0, 16)}${detail}`);
   } catch (e) {
