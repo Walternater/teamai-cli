@@ -122,7 +122,7 @@ vi.mock('../project-agent-root.js', () => ({
   seedProjectAgentRoot: mockSeedProjectAgentRoot,
 }));
 
-import { buildHandlerRegistry, filterHandlersForConfig, type HandlerRegistration } from '../hook-handlers.js';
+import { buildHandlerRegistry, buildVotesNudge, filterHandlersForConfig, type HandlerRegistration } from '../hook-handlers.js';
 import { createDispatcher } from '../hook-dispatch.js';
 
 // ── Tests ────────────────────────────────────────────────
@@ -295,10 +295,25 @@ describe('hook-handlers registry', () => {
     const result = await handler.execute({ session_id: 's', cwd: '/x' }, 'cursor');
     expect(result).not.toBeNull();
     const parsed = JSON.parse(result!);
-    expect(parsed.followup_message).toBe('[teamai] hello');
+    expect(parsed.followup_message).toContain('[teamai] hello');
+    // Cursor hides the payload, so the model is asked to pass it on.
+    expect(parsed.followup_message).toContain('verbatim');
   });
 
-  it.each(['codebuddy', 'codex'])('contribute-check handler asks to stash (not stdout) for %s', async (tool) => {
+  it('gives Claude the hint alone, with nothing telling the model to reprint it', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'contribute-check',
+    )!.handler;
+
+    mockContributeCheckForSession.mockResolvedValueOnce({ hint: '[teamai] hello' });
+
+    const result = await handler.execute({ session_id: 's', cwd: '/x' }, 'claude');
+    const parsed = JSON.parse(result!);
+    expect(parsed.hookSpecificOutput.additionalContext).toBe('[teamai] hello');
+  });
+
+  it.each(['codebuddy', 'codex', 'codex-internal', 'tcodex'])('contribute-check handler asks to stash (not stdout) for %s', async (tool) => {
     const registry = buildHandlerRegistry();
     const handler = registry.find(
       (r) => r.event === 'stop' && r.handler.name === 'contribute-check',
@@ -1212,5 +1227,18 @@ describe('post-tool-use Skill-matcher dispatch routes Cursor SKILL.md Read to th
     expect(payload.data).toEqual({});
     expect(JSON.stringify(payload)).not.toContain('SYNTHETIC_SECRET_NOT_REAL');
     expect(JSON.stringify(payload)).not.toContain('secrets.ts');
+  });
+});
+
+describe('buildVotesNudge', () => {
+  it('names the candidates, the marker and the empty case, in English', () => {
+    const msg = buildVotesNudge(['auth-retry', 'k8s-oom']);
+
+    expect(msg).toContain('auth-retry, k8s-oom');
+    expect(msg).toContain('<!-- teamai:referenced-doc-ids:');
+    expect(msg).toContain('empty list');
+    // Claude Code prints the Stop payload, so this reaches the terminal. The
+    // repository rule is that user-facing CLI output is English (#719).
+    expect(msg).not.toMatch(/[\u4e00-\u9fff]/);
   });
 });
