@@ -731,6 +731,11 @@ export interface HookDef {
    * include one of these ids. Omitted = every member; [] = nobody, like tools.
    */
   roles?: string[];
+  /**
+   * Team hooks only: ship only to directories bound to one of these logical
+   * project ids. Omitted = every directory; [] = nobody. ANDs with `roles`.
+   */
+  projects?: string[];
 }
 
 // ─── MCP server definitions ──────────────────────────────
@@ -768,6 +773,12 @@ export interface McpServerDef {
   tools?: string[];
   /** Restrict to members holding one of these role ids (default = every member; [] = nobody). */
   roles?: string[];
+  /**
+   * Restrict to directories bound to one of these logical project ids (default =
+   * every directory; [] = nobody). ANDs with `roles`: a server scoping both
+   * reaches members who match both.
+   */
+  projects?: string[];
 }
 
 /** One injected MCP server recorded in the manifest. */

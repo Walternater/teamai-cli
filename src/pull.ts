@@ -673,17 +673,24 @@ async function cleanupTombstonedResources(
  * from the original pull() function to support both user and project scope.
  */
 /**
- * Report the one shape that makes an env count of 0 a mistake rather than an
- * empty file: no top-level `variables:` key, which zod accepts without a word.
- * The env resource is skipped the moment its count reads 0, so this is the only
- * place the check can run (#662).
+ * Env on the "Already synced" fast path: deliver what env.yaml scopes to this
+ * directory, and report the one shape that makes an env count of 0 a mistake
+ * rather than an empty file (no top-level `variables:` key, which zod accepts
+ * without a word, #662).
  *
- * Called from both the full sync and the "Already synced" fast path. A machine
- * that recorded `lastPullRev` before the file was mangled keeps that rev and
- * takes the fast path on every later pull, so the Step 2 call site alone would
- * never reach it — the misconfiguration would stay invisible.
+ * Hooks and MCP are reconciled outside `pullForScope`, so the fast path never
+ * hides a scoping change from them. Env is delivered inside the loop, and the
+ * loop is exactly what the fast path skips. Two things reach a machine with an
+ * unchanged `lastPullRev` only through here: a CLI upgrade that starts
+ * honouring `roles:`/`projects:` on env variables (the repo did not move, so
+ * without this a variable scoped away stays exported until `--force`), and a
+ * mangled env.yaml on a machine that recorded its rev before the mangling.
+ *
+ * Quiet on success: this runs on every session start. `pullItem` rewrites
+ * `env.sh` from the filtered set and leaves an unchanged shell profile alone.
+ * A failure is not quiet — see the catch.
  */
-async function warnIfEnvYamlShapeIsWrong(
+async function reconcileEnvForUnchangedRepo(
   freshConfig: TeamaiConfig,
   localConfig: LocalConfig,
 ): Promise<void> {
@@ -692,12 +699,25 @@ async function warnIfEnvYamlShapeIsWrong(
     const envItems = await envHandler.scanTeamForPull(freshConfig, localConfig);
     if (envItems.length === 0) return;
     const varCount = await envHandler.countEnvVars(envItems[0].sourcePath);
-    if (varCount !== 0) return;
-    const shapeProblem = await envHandler.describeEnvYamlShapeProblemAt(envItems[0].sourcePath);
-    if (shapeProblem) log.warn(shapeProblem);
+    if (varCount === 0) {
+      const shapeProblem = await envHandler.describeEnvYamlShapeProblemAt(envItems[0].sourcePath);
+      if (shapeProblem) log.warn(shapeProblem);
+      return;
+    }
+    await envHandler.pullItem(envItems[0], freshConfig, localConfig);
   } catch (e) {
-    // Never let a diagnostic take down the pull it is diagnosing.
-    log.debug(`env.yaml shape check skipped: ${(e as Error).message}`);
+    // Visible rather than debug-only, and still not rethrown. This is the path
+    // that REMOVES a variable the member is no longer scoped to, so a failed
+    // write leaves a withheld variable exported while the only thing on screen
+    // says "Already synced". The pull it runs beside has already succeeded, so
+    // the failure is reported where the member can act on it instead of taking
+    // that pull down with it.
+    const envShPath = path.join(getDataHome(localConfig), 'env.sh');
+    log.warn(
+      `[${localConfig.scope}] Could not refresh env variables: ${(e as Error).message}. `
+      + `${envShPath} may still export variables env.yaml no longer delivers to this directory. `
+      + 'Fix the cause, run `teamai pull --force`, then open a new shell.',
+    );
   }
 }
 
@@ -981,10 +1001,11 @@ async function pullForScope(
           // CLI keeps the copies that CLI failed to delete, and its stored rev
           // never moves again. Re-run the cleanup so the upgrade reaches it (#576).
           await cleanupTombstonedResources(freshConfig, localConfig, scopeLabel);
-          // A repo that has not moved can still carry a malformed env.yaml, and
-          // the Step 2 check below is unreachable from this branch.
+          // A repo that has not moved can still carry a malformed env.yaml, or
+          // scope a variable this CLI version now withholds; the Step 2 env
+          // branch below is unreachable from here.
           if (resourceTypes.includes('env')) {
-            await warnIfEnvYamlShapeIsWrong(freshConfig, localConfig);
+            await reconcileEnvForUnchangedRepo(freshConfig, localConfig);
           }
           // The knowledge branch has its own history: a teammate's contribution
           // moves teamai-learnings without touching main, so main's revision is
@@ -1069,12 +1090,34 @@ async function pullForScope(
         continue;
       }
 
+      // What the team declares (`varCount`, above) is not what reaches this
+      // member: a variable can carry `roles:`/`projects:`. Report the delivered
+      // number, and name the declared one when they differ so a member who
+      // expected a variable can see it was scoped away rather than lost.
+      //
+      // Resolved here rather than inside pullItem so `--dry-run` warns about an
+      // unknown role or project id too. Checking a scoping edit is exactly what
+      // a maintainer runs --dry-run for, and hooks and MCP already warn there.
+      const { resolveDeliverableEnvVariables } = await import('./resources/env.js');
+      const { resolveMembership, warnUnknownMembershipIds } = await import('./membership.js');
+      const declaredVars = (await envHandler.readEnvYaml(items[0].sourcePath));
+      const declared = declaredVars.ok ? declaredVars.variables : [];
+      await warnUnknownMembershipIds(
+        localConfig.repo.localPath,
+        'env.yaml',
+        declared.map((v) => ({ kind: 'variable', name: v.key, roles: v.roles, projects: v.projects })),
+      );
+      const deliverable = resolveDeliverableEnvVariables(declared, resolveMembership(localConfig)).length;
+      const countLabel = deliverable === varCount
+        ? `${varCount} env variable(s)`
+        : `${deliverable} of ${varCount} env variable(s)`;
+
       if (options.dryRun) {
-        log.info(`[${scopeLabel}] [dry-run] Would sync ${varCount} env variable(s)`);
+        log.info(`[${scopeLabel}] [dry-run] Would sync ${countLabel}`);
       } else {
         await envHandler.pullItem(items[0], freshConfig, localConfig);
         const teamaiHome = getDataHome(localConfig);
-        log.success(`[${scopeLabel}] Synced ${varCount} env variable(s) to ${teamaiHome}/env.sh`);
+        log.success(`[${scopeLabel}] Synced ${countLabel} to ${teamaiHome}/env.sh`);
       }
       totalSynced += 1;
       continue;
