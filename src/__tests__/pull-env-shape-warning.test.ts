@@ -132,6 +132,7 @@ describe('env.yaml shape warning on a real pull', () => {
       localConfig,
       teamConfig,
       toolPaths: teamConfig.toolPaths,
+      hookToolPaths: teamConfig.toolPaths,
       baseDir: homeDir,
     };
     vi.mocked(resolveDoctorContext).mockResolvedValue(ctx);

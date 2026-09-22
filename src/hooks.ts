@@ -1439,6 +1439,25 @@ export async function reconcileHooksToAllTools(
     : skipToolsWithoutShell(
         Object.keys(toolPaths).filter(t => !opts.filterAgents || opts.filterAgents.includes(t)),
       );
+  // One settings file is one install. Two targets can resolve to the same file —
+  // Qoder CN's project scope IS Qoder's `<root>/.qoder/settings.json` — and this
+  // pass is per tool, so a second pass over the file re-renders every built-in
+  // entry with the *other* tool's dispatch identity (`teamai hook-dispatch …
+  // --tool <tool>`) and drops the team hooks scoped to the first one. Reconcile
+  // each file once, for the first target that reaches it.
+  //
+  // The owner is the first *enabled* target, not the first in the shipped table:
+  // `filterAgents` is applied above, so a tool the user excluded is skipped before
+  // it can claim a file, and an install that enabled Qoder CN without Qoder gets
+  // `--tool qoder-cn` built-ins plus its `tools: [qoder-cn]` team hooks in the
+  // shared project file instead of Qoder's identity (and Qoder's team hooks).
+  //
+  // With both editions enabled (the default: no whitelist) `qoder` comes first in
+  // the table and keeps ownership, so a `tools: [qoder-cn]` team hook has no file
+  // to land in and is dropped silently by the per-tool filter in reconcileHooks.
+  // One physical file can carry only one dispatch identity; this is the documented
+  // limit of sharing a project scope, not a bug this pass can fix.
+  const claimedSettingsFiles = new Set<string>();
   for (const [tool, paths] of Object.entries(toolPaths)) {
     if (opts.filterAgents && !opts.filterAgents.includes(tool)) continue;
     if (skipped.has(tool)) continue;
@@ -1497,6 +1516,9 @@ export async function reconcileHooksToAllTools(
       : toolRoot;
     if (!await pathExists(toolRoot) && !await pathExists(installedRoot)) continue;
     const settingsPath = path.join(baseDir, paths.settings);
+    const settingsFileKey = path.resolve(settingsPath);
+    if (claimedSettingsFiles.has(settingsFileKey)) continue;
+    claimedSettingsFiles.add(settingsFileKey);
     try {
       await reconcileHooks(settingsPath, tool, teamDefs, {
         manifestPath,
@@ -1589,7 +1611,7 @@ export async function reconcileTeamHooksForConfig(
         silent: opts.silent,
         activeRoles: activeRoleIds(localConfig),
       });
-  const { baseDir, manifestPath } = resolveHookScope(localConfig);
+  const { baseDir, manifestPath, scope: hookScope } = resolveHookScope(localConfig);
   const explicitlySelectedAgents = opts.filterAgents ?? localConfig.enabledAgents;
   let filterAgents = explicitlySelectedAgents;
   const disabled = localConfig.disabledAgents;
@@ -1599,7 +1621,10 @@ export async function reconcileTeamHooksForConfig(
     const universe = filterAgents ?? Object.keys(teamConfig.toolPaths);
     filterAgents = universe.filter((t) => !disabled.includes(t));
   }
-  await reconcileHooksToAllTools(teamConfig.toolPaths, baseDir, teamDefs, manifestPath, {
+  // Resolve the tool paths at the scope hooks actually live in, not at the
+  // config's scope: a non-self project scope puts hooks in HOME, so its paths
+  // must be the user-scope ones.
+  await reconcileHooksToAllTools(scopedToolPaths(teamConfig, { ...localConfig, scope: hookScope }), baseDir, teamDefs, manifestPath, {
     removeAll: opts.removeAll,
     builtinOverride: builtin,
     filterAgents,

@@ -126,6 +126,7 @@ describe('checks at the end of an interactive pull', () => {
       localConfig,
       teamConfig,
       toolPaths: teamConfig.toolPaths,
+      hookToolPaths: teamConfig.toolPaths,
       baseDir: homeDir,
     };
     vi.mocked(resolveDoctorContext).mockResolvedValue(ctx);

@@ -767,6 +767,7 @@ servers:
 | copilot | `$COPILOT_HOME/mcp-config.json` | `<project>/.github/mcp.json` |
 | codex | `~/.codex/config.toml` | 不支持 |
 | qoder | `~/.qoder/settings.json` | `<project>/.qoder/settings.json` |
+| qoder-cn | `~/.qoder-cn/settings.json` | `<project>/.qoder/settings.json` |
 | kiro | `~/.kiro/settings/mcp.json` | `<project>/.kiro/settings/mcp.json` |
 | opencode | `~/.config/opencode/opencode.json` | `<project>/opencode.json` |
 | omp | `~/.omp/agent/mcp.json` | `<project>/.omp/mcp.json` |
@@ -1432,6 +1433,8 @@ GitHub Copilot CLI 已支持其官方自定义指令、Rules、Skills、自定�
 ### Qoder
 
 Qoder 已作为内置目标支持。TeamAI 会将 Skills、Rules 和 Subagents 分别下发到 `.qoder/skills/`、`.qoder/rules/` 和 `.qoder/agents/`。Hooks 与 MCP Server 会合并进对应作用域的 `.qoder/settings.json`，并保留用户已有的其他设置；这些路径与 Qoder 的用户级和项目级配置约定一致。
+
+Qoder CN 是独立发行的版本，其**用户级**目录为 `~/.qoder-cn` 而非 `~/.qoder`，因此它作为独立的内置目标 `qoder-cn` 支持，而不是并入 `qoder`。两者仅用户作用域不同：用户级的资源写入 `~/.qoder-cn/{skills,rules,agents}`，Hooks 与 MCP 写入 `~/.qoder-cn/settings.json`；项目作用域则沿用 Qoder 的 `<project>/.qoder/` 布局。两者读取相同的 Claude 兼容资源格式，因此下发内容一致，仅用户级根目录不同。同时安装两个版本时，TeamAI 会分别同步到各自的用户目录，无需再建软链接。
 
 ### Kiro
 

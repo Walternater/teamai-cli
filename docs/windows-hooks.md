@@ -119,6 +119,7 @@ Apply this to every agent that has hooks:
 - `~/.zcode/cli/config.json` — `command` field → Git Bash path; 6 hooks
 - `~/.codebuddy/settings.json` — create if missing; 6 hooks
 - `~/.qoder/settings.json` — create if missing; 6 hooks
+- `~/.qoder-cn/settings.json` — Qoder CN; same as Qoder but under its own user root
 - WorkBuddy / Cline / Cursor / OpenCode settings as applicable
 
 Use a JSON-aware edit (don't hand-edit with `sed` — the double quotes must stay
@@ -149,9 +150,11 @@ Now a bare `bash` hook finds `teamai` → `cmd.exe` → native Windows TeamAI. T
 
 ### Completeness for all tools
 
-- Add `qoder` and `codebuddy` to `enabledAgents` in `~/.teamai/config.yaml`.
-- Copy the team's skills and rules from the team repo into `~/.qoder` and
-  `~/.codebuddy` so those agents are fully equipped, not just hooked.
+- Add `qoder`, `qoder-cn`, and `codebuddy` to `enabledAgents` in `~/.teamai/config.yaml`.
+- Copy the team's skills and rules from the team repo into `~/.qoder`,
+  `~/.qoder-cn`, and `~/.codebuddy` so those agents are fully equipped, not just
+  hooked. (Qoder CN reads `~/.qoder-cn/` for its user scope; its project scope
+  stays `<project>/.qoder/`, shared with Qoder.)
 
 ---
 
@@ -161,7 +164,7 @@ Now a bare `bash` hook finds `teamai` → `cmd.exe` → native Windows TeamAI. T
 teamai doctor
 ```
 
-Expected: hooks present for **claude, codex, qoder, zcode, codebuddy,
+Expected: hooks present for **claude, codex, qoder, qoder-cn, zcode, codebuddy,
 workbuddy**.
 
 Per-tool dispatch check, both ways:
@@ -177,9 +180,9 @@ wsl bash -lc "teamai hook-dispatch session-start --tool claude 2>/dev/null"; ech
 Every tool should print `0` through both mechanisms.
 
 ```text
-doctor:   ✔ claude ✔ codex ✔ qoder ✔ zcode ✔ codebuddy ✔ workbuddy
-dispatch (Git-Bash path): claude=0 codex=0 zcode=0 codebuddy=0 qoder=0
-dispatch (bare bash/WSL): claude=0 codex=0 zcode=0 codebuddy=0 qoder=0 workbuddy=0
+doctor:   ✔ claude ✔ codex ✔ qoder ✔ qoder-cn ✔ zcode ✔ codebuddy ✔ workbuddy
+dispatch (Git-Bash path): claude=0 codex=0 zcode=0 codebuddy=0 qoder=0 qoder-cn=0
+dispatch (bare bash/WSL): claude=0 codex=0 zcode=0 codebuddy=0 qoder=0 qoder-cn=0 workbuddy=0
 ```
 
 ---
@@ -281,7 +284,8 @@ wsl bash -lc "teamai hook-dispatch session-start --tool claude 2>/dev/null"; ech
 | `~/.zcode/cli/config.json` | `command` field → Git Bash path (backup: `*.teamai-bak`) |
 | `~/.codebuddy/settings.json` | created with 6 hooks (if missing) |
 | `~/.qoder/settings.json` | created with 6 hooks (if missing) |
-| `~/.teamai/config.yaml` | `enabledAgents` += `qoder`, `codebuddy` |
-| `~/.qoder/{skills,rules}`, `~/.codebuddy/{skills,rules}` | team resources copied |
+| `~/.qoder-cn/settings.json` | Qoder CN; created with 6 hooks (if missing) |
+| `~/.teamai/config.yaml` | `enabledAgents` += `qoder`, `qoder-cn`, `codebuddy` |
+| `~/.qoder/{skills,rules}`, `~/.qoder-cn/{skills,rules}`, `~/.codebuddy/{skills,rules}` | team resources copied |
 | `~/.teamai-wsl/bin/teamai` (Win) + `<wsl-home>/.teamai-wsl/bin/teamai` (WSL) | durability wrapper |
 | `~/.profile`, `~/.bashrc` | PATH export (marker `# [teamai-wsl-fix]`) |

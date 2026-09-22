@@ -1710,14 +1710,16 @@ async function reinjectLegacyHooks(localConfig: LocalConfig): Promise<void> {
   // The old-format check reads HOME; for a non-self project scope resolveBaseDir
   // → <projectRoot>, so reinjecting there never clears HOME's legacy format and
   // this migration would re-fire on every pull (#370).
-  const { baseDir } = resolveHookScope(localConfig);
+  const { baseDir, scope: hookScope } = resolveHookScope(localConfig);
   const disabled = localConfig.disabledAgents;
   let hookFilter = localConfig.enabledAgents;
   if (disabled && disabled.length > 0) {
     const universe = hookFilter ?? Object.keys(teamConfig.toolPaths);
     hookFilter = universe.filter((t) => !disabled.includes(t));
   }
-  await injectHooksToAllTools(teamConfig.toolPaths, baseDir, hookFilter);
+  // Paths follow the same scope decision as `baseDir`: a non-self project scope
+  // injects into HOME, so it must use the user-scope paths there.
+  await injectHooksToAllTools(scopedToolPaths(teamConfig, { ...localConfig, scope: hookScope }), baseDir, hookFilter);
   log.debug('Hooks migrated to dispatch format');
 }
 

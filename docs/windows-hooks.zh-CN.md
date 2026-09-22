@@ -112,6 +112,7 @@ export function hasShell(): boolean {
 - `~/.zcode/cli/config.json` — `command` 字段 → Git Bash 路径；6 个钩子
 - `~/.codebuddy/settings.json` — 若不存在则创建；6 个钩子
 - `~/.qoder/settings.json` — 若不存在则创建；6 个钩子
+- `~/.qoder-cn/settings.json` — Qoder CN；与 Qoder 相同，但位于其独立的用户根目录下
 - WorkBuddy / Cline / Cursor / OpenCode 等对应配置
 
 请用支持 JSON 的编辑器修改（不要用 `sed` 手工改——双引号必须保持转义）。建议为每个
@@ -141,9 +142,10 @@ export PATH="$HOME/.teamai-wsl/bin:$PATH"
 
 ### 让所有工具都完整可用
 
-- 在 `~/.teamai/config.yaml` 的 `enabledAgents` 中加入 `qoder` 和 `codebuddy`。
-- 把团队仓库中的技能与规则复制到 `~/.qoder` 和 `~/.codebuddy`，让这些代理不仅接入
-  钩子，而且具备完整能力。
+- 在 `~/.teamai/config.yaml` 的 `enabledAgents` 中加入 `qoder`、`qoder-cn` 和 `codebuddy`。
+- 把团队仓库中的技能与规则复制到 `~/.qoder`、`~/.qoder-cn` 和 `~/.codebuddy`，让这些代理不仅接入
+  Hooks，也具备完整的技能与规则。（Qoder CN 的用户作用域读取 `~/.qoder-cn/`；其项目作用域仍为
+  `<project>/.qoder/`，与 Qoder 共用。）
 
 ---
 
@@ -153,7 +155,7 @@ export PATH="$HOME/.teamai-wsl/bin:$PATH"
 teamai doctor
 ```
 
-预期：为 **claude、codex、qoder、zcode、codebuddy、workbuddy** 报告钩子存在。
+预期：为 **claude、codex、qoder、qoder-cn、zcode、codebuddy、workbuddy** 报告钩子存在。
 
 按工具分别检查两种方式：
 
@@ -168,9 +170,9 @@ wsl bash -lc "teamai hook-dispatch session-start --tool claude 2>/dev/null"; ech
 每个工具通过两种机制都应打印 `0`。
 
 ```text
-doctor:   ✔ claude ✔ codex ✔ qoder ✔ zcode ✔ codebuddy ✔ workbuddy
-dispatch (Git-Bash 路径): claude=0 codex=0 zcode=0 codebuddy=0 qoder=0
-dispatch (裸 bash/WSL):  claude=0 codex=0 zcode=0 codebuddy=0 qoder=0 workbuddy=0
+doctor:   ✔ claude ✔ codex ✔ qoder ✔ qoder-cn ✔ zcode ✔ codebuddy ✔ workbuddy
+dispatch (Git-Bash 路径): claude=0 codex=0 zcode=0 codebuddy=0 qoder=0 qoder-cn=0
+dispatch (裸 bash/WSL):  claude=0 codex=0 zcode=0 codebuddy=0 qoder=0 qoder-cn=0 workbuddy=0
 ```
 
 ---
@@ -266,7 +268,8 @@ wsl bash -lc "teamai hook-dispatch session-start --tool claude 2>/dev/null"; ech
 | `~/.zcode/cli/config.json` | `command` 字段 → Git Bash 路径（备份：`*.teamai-bak`） |
 | `~/.codebuddy/settings.json` | 若不存在则创建，含 6 个钩子 |
 | `~/.qoder/settings.json` | 若不存在则创建，含 6 个钩子 |
-| `~/.teamai/config.yaml` | `enabledAgents` += `qoder`、`codebuddy` |
-| `~/.qoder/{skills,rules}`、`~/.codebuddy/{skills,rules}` | 复制团队资源 |
+| `~/.qoder-cn/settings.json` | Qoder CN；若不存在则创建，含 6 个钩子 |
+| `~/.teamai/config.yaml` | `enabledAgents` += `qoder`、`qoder-cn`、`codebuddy` |
+| `~/.qoder/{skills,rules}`、`~/.qoder-cn/{skills,rules}`、`~/.codebuddy/{skills,rules}` | 复制团队资源 |
 | `~/.teamai-wsl/bin/teamai`（Win）+ `<wsl-home>/.teamai-wsl/bin/teamai`（WSL） | 持久化包装脚本 |
 | `~/.profile`、`~/.bashrc` | PATH 导出（标记 `# [teamai-wsl-fix]`） |

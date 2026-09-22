@@ -42,6 +42,7 @@ import { getHookStatus, reconcileHooks, reconcileHooksToAllTools, reconcileTeamH
 import { parseTeamHooks } from '../resources/hooks.js';
 import { log } from '../utils/logger.js';
 import { hooksInject, hooksRemove, hooksList } from '../hooks-cmd.js';
+import { TeamaiConfigSchema } from '../types.js';
 
 const mockedAutoDetectInit = autoDetectInit as Mock;
 const mockedGetHookStatus = getHookStatus as Mock;
@@ -292,6 +293,127 @@ describe('hooksList', () => {
         mockedAutoDetectInit.mockRejectedValue(new Error('teamai is not initialized'));
 
         await expect(hooksList({})).rejects.toThrow('not initialized');
+    });
+
+    // #667: a non-self project scope injects hooks into HOME (#264), so the file
+    // to probe is the one the injected scope names. Qoder CN keeps its user-scope
+    // resources in ~/.qoder-cn, so the previous project-scope lookup probed the
+    // international build's ~/.qoder/settings.json and always said "missing".
+    it('probes each tool settings file at the scope hooks were injected into', async () => {
+        const restoreHome = mockHome('/home/testuser');
+        const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+        mockedAutoDetectInit.mockResolvedValue({
+            localConfig: { ...mockLocalConfig, scope: 'project', projectRoot: '/path/to/project' },
+            teamConfig: TeamaiConfigSchema.parse({ team: 'test', repo: 'test/repo' }),
+        });
+
+        try {
+            await hooksList({});
+        } finally {
+            restoreHome();
+            consoleLog.mockRestore();
+        }
+
+        expect(mockedGetHookStatus).toHaveBeenCalledWith(
+            path.join('/home/testuser', '.qoder-cn', 'settings.json'),
+            'qoder-cn',
+        );
+        expect(mockedGetHookStatus).not.toHaveBeenCalledWith(
+            path.join('/home/testuser', '.qoder', 'settings.json'),
+            'qoder-cn',
+        );
+    });
+
+    // #667: Qoder CN's project scope IS Qoder's `<root>/.qoder/settings.json`, so
+    // the file is one install. Listing it twice would report the second target as
+    // "missing" — the hooks there carry the owning target's dispatch identity.
+    it('lists a settings file shared by two targets once, for its owner', async () => {
+        const restoreHome = mockHome('/home/testuser');
+        const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+        const projectRoot = '/path/to/project';
+        mockedAutoDetectInit.mockResolvedValue({
+            localConfig: {
+                ...mockLocalConfig,
+                scope: 'project',
+                projectRoot,
+                repo: { ...mockLocalConfig.repo, kind: 'self', businessRepoRoot: projectRoot },
+            },
+            teamConfig: TeamaiConfigSchema.parse({ team: 'test', repo: 'test/repo' }),
+        });
+
+        try {
+            await hooksList({});
+        } finally {
+            restoreHome();
+            consoleLog.mockRestore();
+        }
+
+        const shared = path.join(projectRoot, '.qoder', 'settings.json');
+        expect(mockedGetHookStatus).toHaveBeenCalledWith(shared, 'qoder');
+        expect(mockedGetHookStatus).not.toHaveBeenCalledWith(shared, 'qoder-cn');
+    });
+
+    // #667: ownership of the file shared by Qoder and Qoder CN follows the
+    // *enabled* target, not the shipped table order. The write path only ever
+    // renders the file for an enabled target (`filterAgents`), so `hooks list`
+    // must skip a disabled one before it can claim the file. Otherwise a
+    // self-scope install that enabled Qoder CN alone probed
+    // `<root>/.qoder/settings.json` for Qoder's dispatch identity, reported
+    // `missing`, and never listed the enabled `qoder-cn` at all.
+    it('gives the shared file to the enabled target, not the table-earlier one', async () => {
+        const restoreHome = mockHome('/home/testuser');
+        const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+        const projectRoot = '/path/to/project';
+        mockedAutoDetectInit.mockResolvedValue({
+            localConfig: {
+                ...mockLocalConfig,
+                scope: 'project',
+                projectRoot,
+                enabledAgents: ['qoder-cn'],
+                repo: { ...mockLocalConfig.repo, kind: 'self', businessRepoRoot: projectRoot },
+            },
+            teamConfig: TeamaiConfigSchema.parse({ team: 'test', repo: 'test/repo' }),
+        });
+
+        try {
+            await hooksList({});
+        } finally {
+            restoreHome();
+            consoleLog.mockRestore();
+        }
+
+        const shared = path.join(projectRoot, '.qoder', 'settings.json');
+        expect(mockedGetHookStatus).toHaveBeenCalledWith(shared, 'qoder-cn');
+        // `qoder` is not enabled, so it must not claim — and mis-probe — the file.
+        expect(mockedGetHookStatus).not.toHaveBeenCalledWith(shared, 'qoder');
+    });
+
+    // The same rule with no whitelist: `disabledAgents` alone moves ownership.
+    it('gives the shared file to Qoder CN when Qoder is disabled', async () => {
+        const restoreHome = mockHome('/home/testuser');
+        const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+        const projectRoot = '/path/to/project';
+        mockedAutoDetectInit.mockResolvedValue({
+            localConfig: {
+                ...mockLocalConfig,
+                scope: 'project',
+                projectRoot,
+                disabledAgents: ['qoder'],
+                repo: { ...mockLocalConfig.repo, kind: 'self', businessRepoRoot: projectRoot },
+            },
+            teamConfig: TeamaiConfigSchema.parse({ team: 'test', repo: 'test/repo' }),
+        });
+
+        try {
+            await hooksList({});
+        } finally {
+            restoreHome();
+            consoleLog.mockRestore();
+        }
+
+        const shared = path.join(projectRoot, '.qoder', 'settings.json');
+        expect(mockedGetHookStatus).toHaveBeenCalledWith(shared, 'qoder-cn');
+        expect(mockedGetHookStatus).not.toHaveBeenCalledWith(shared, 'qoder');
     });
 
     it('lists standalone Copilot hooks under COPILOT_HOME', async () => {

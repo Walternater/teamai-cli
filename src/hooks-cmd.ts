@@ -8,6 +8,7 @@ import type { GlobalOptions } from './types.js';
 import {
     COPILOT_TOOL_ID,
     getManagedHooksPath,
+    isAgentExcluded,
     resolveHookScope,
     resolveToolBaseDir,
     scopedToolPaths,
@@ -87,15 +88,39 @@ export async function hooksInject(options: GlobalOptions): Promise<void> {
  */
 export async function hooksList(_options: GlobalOptions): Promise<void> {
     const { localConfig, teamConfig } = await autoDetectInit();
-    const { baseDir } = resolveHookScope(localConfig);
+    const { baseDir, scope: hookScope } = resolveHookScope(localConfig);
+    // The settings file must be resolved at the scope hooks were injected into,
+    // not at the config's scope: a non-self project scope injects into HOME, and a
+    // tool whose user-scope prefix differs from its project-scope one (Qoder CN:
+    // `~/.qoder-cn` vs `<root>/.qoder`) would otherwise be probed in the *other*
+    // build's file and always reported missing.
+    const hookScopedPaths = scopedToolPaths(teamConfig, { ...localConfig, scope: hookScope });
     const rows: HookListRow[] = [];
+    // One settings file is one install, so list it once, for the target that owns
+    // it — the same rule the write path applies. Qoder CN shares Qoder's project
+    // file, and probing it as its own identity there would report a healthy
+    // install as `missing`.
+    //
+    // Ownership follows the enabled set, not the shipped table: the write path
+    // only ever renders the file for an enabled target, so a target the user
+    // disabled must not claim it here either. Otherwise a self-scope install that
+    // enabled Qoder CN alone would have `qoder` (off, but earlier in the table)
+    // claim `<root>/.qoder/settings.json`, probe it for Qoder's dispatch identity,
+    // and report `missing` while the enabled `qoder-cn` was never listed at all.
+    // `isAgentExcluded` is the same filter `doctor` applies to this path table.
+    const seenSettingsFiles = new Set<string>();
 
     for (const [tool, paths] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+        if (isAgentExcluded(localConfig, tool)) continue;
         const hookPath = paths.hooks
             ? path.join(resolveToolBaseDir(tool, localConfig), paths.hooks)
-            : paths.settings
-                ? path.join(baseDir, paths.settings)
+            : hookScopedPaths[tool]?.settings
+                ? path.join(baseDir, hookScopedPaths[tool].settings)
                 : undefined;
+        if (hookPath) {
+            if (seenSettingsFiles.has(hookPath)) continue;
+            seenSettingsFiles.add(hookPath);
+        }
         // OMP has no settings/hooks file to parse: its hooks are a single
         // generated extension under the user agent dir, so presence of the
         // file (with our marker) is the whole status.
@@ -153,8 +178,11 @@ export async function hooksList(_options: GlobalOptions): Promise<void> {
 export async function hooksRemove(_options: GlobalOptions): Promise<void> {
     const { localConfig, teamConfig } = await autoDetectInit();
 
-    const { baseDir, manifestPath } = resolveHookScope(localConfig);
-    await reconcileHooksToAllTools(teamConfig.toolPaths, baseDir, [], manifestPath, { removeAll: true });
+    const { baseDir, manifestPath, scope: hookScope } = resolveHookScope(localConfig);
+    // Removal must target the same paths injection used. A non-self project
+    // scope injects into HOME, so resolving the project-scope paths here would
+    // miss (and leave behind) every tool whose user-scope prefix differs.
+    await reconcileHooksToAllTools(scopedToolPaths(teamConfig, { ...localConfig, scope: hookScope }), baseDir, [], manifestPath, { removeAll: true });
 
     const copilotPaths = scopedToolPaths(teamConfig, localConfig)[COPILOT_TOOL_ID];
     if (copilotPaths?.hooks) {
