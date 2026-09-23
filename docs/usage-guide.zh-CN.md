@@ -432,9 +432,29 @@ teamai list --source local          # 各已安装 agent 下的 skills
 teamai list --agent claude --verbose
 teamai list env --reveal            # 明文显示 env（默认脱敏）
 
-teamai skill                        # 等价于 teamai list skills --source all
+teamai skill                        # 先输出 teamai list skills --source all，再列出 CLI 内置 skill 目录
 teamai skill show hai-deploy-test   # 看单个 skill 的来源 / 贡献者 / 安装位置 / 描述摘要
+
+teamai skill list --json            # 当前 CLI 提供的内置 skill 清单（机器可读）
+teamai skill get core               # 打印内置工作流：core | setup | wiki | share
+teamai skill get wiki --full        # 同时附上该 skill 的 references 与 templates
+teamai skill path wiki              # 打印打包目录，用于运行 skill 自带的脚本
 ```
+
+#### 内置 skill 随 CLI 一起版本化
+
+内置工作流（`core`、`setup`、`wiki`、`share`）随 npm 包一起发布，由已安装的 CLI 通过 `teamai skill get`
+按需打印，因此 agent 读到的内容始终与正在运行的 CLI 版本一致——`npm i -g teamai-cli@latest` 本身就是更新，
+无需 `teamai pull` 内容就是最新的。每个 agent 只收到一个文件：`~/.<tool>/skills/teamai/SKILL.md`（或该工具存放团队 skill 的位置：OpenClaw 的 workspace、`HERMES_HOME`），
+一个指向这些命令的小型发现入口（stub）。旧版本会把整棵目录复制到每个 agent 下，两次 pull 之间内容会过时；
+`teamai pull` 会清除这些残留，并把每个被删除的文件先复制到 `~/.teamai/removed-skills/` 下（每次 pull 一个目录；
+`teamai uninstall` 会删除 `~/.teamai/`，这份备份也随之删除）。只删除内容与某个发布版本完全一致的文件：你改过的打包文件，
+或你自己用旧名字写的 skill，都属于你，会保留。目录里若还有你自己的文件，
+只删除其中的打包文件，保留该目录和你的文件，并在 pull 输出中点名。`share` 只在开启 recall 后才会提供（默认关闭；
+团队在 `teamai.yaml` 设置 `sharing.recall.enabled: true`，或单台机器运行 `teamai recall enable`）：在此之前，
+`teamai skill get share` 会拒绝并说明原因。
+只读 HTTP 源上它同样会拒绝，因为 `teamai contribute` 无法写入。旧名字仍然可用：
+`teamai skill get team-wiki-codebase` 等价于 `wiki`。
 
 ---
 
@@ -868,10 +888,10 @@ AI 通过 Hooks 追踪你的编码会话。当会话结束时（Stop hook），�
 
 Task: Fix duplicate project-level Hook injection
 
-Consider running /teamai-share-learnings to summarize what you learned and share it with your team.
+Consider running `/teamai share what this session taught me` to summarize what you learned and share it with your team (or run `teamai skill get share`).
 ```
 
-提醒会列出实际触发它的非零摩擦信号；如果能取得首个任务，还会附上脱敏、单行化后的任务摘要，便于判断本次 session 是否值得分享。使用内置 skill `/teamai-share-learnings`，AI 会自动总结本次 session 经验并贡献到团队知识库。每个 session 最多提示一次。
+提醒会列出实际触发它的非零摩擦信号；如果能取得首个任务，还会附上脱敏、单行化后的任务摘要，便于判断本次 session 是否值得分享。使用内置 `share` 工作流（`teamai skill get share`），AI 会自动总结本次 session 经验并贡献到团队知识库。每个 session 最多提示一次。
 
 在 Codex 系列（`codex`、`codex-internal`、`tcodex`）中，Stop hook 会暂存贡献和知识引用提醒，在同一会话的下一次 UserPromptSubmit 交付，不会强制开启额外一轮。贡献提醒只交付一次；若下一次输入前已经贡献，则丢弃该提醒。
 
@@ -892,7 +912,9 @@ teamai contribute --file /tmp/session.md --scope project
 | 用户覆盖 | `~/.teamai/config.yaml` | `contributeHintEnabled` | `true` / `false`，优先级高于团队默认 |
 | 环境变量 | shell | `TEAMAI_CONTRIBUTE_HINT_DISABLED=1` | 强制关闭提醒（紧急开关） |
 
-只影响提醒本身：摩擦评分、`teamai contribute --file` 和手动调用 `/teamai-share-learnings` 不受影响。
+只影响提醒本身：摩擦评分、`teamai contribute --file` 和手动调用 `/teamai` 不受影响。
+
+未开启 recall 时（默认关闭；团队在 `teamai.yaml` 设置 `sharing.recall.enabled: true`，或单台机器运行 `teamai recall enable`）也不会显示这条提醒：提醒指向 `share` 工作流，而 recall 关闭时 `teamai skill get share` 会拒绝执行。只读 HTTP 源上这条提醒也从不出现，因为 `share` 同样会拒绝。
 
 ### 搜索知识
 
@@ -1788,7 +1810,7 @@ sharing:
   coAuthor:
     enabled: false             # 可选，为全团队去除 AI 工具提交尾注
   contributeHint:
-    enabled: true              # 可选，false = 高摩擦 session 结束后不再提示 /teamai-share-learnings
+    enabled: true              # 可选，false = 高摩擦 session 结束后不再提示 /teamai
   intervention:
     correctionKeywords: []     # 可选，额外的纠偏词，与内置中/英/日列表合并
   webhooks:                    # 可选，在团队事件发生时通知外部端点（见"Webhook 通知"）

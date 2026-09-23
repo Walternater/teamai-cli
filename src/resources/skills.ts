@@ -5,7 +5,7 @@ import type { ResourceItem, ResourceItemStatus, DeliveryTarget, TeamaiConfig, Lo
 import { getPushignorePath, isAgentExcluded, resolveToolBaseDir, scopedToolPaths } from '../types.js';
 import { listDirs, listFilesRecursive, pathExists, copyDir, remove, pruneEmptyDirs, dirContentEqual, dirTeamSubsetEqual, getDirLatestMtime, readFileSafe, writeFile } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
-import { BUILTIN_SKILL_NAMES } from '../builtin-skills.js';
+import { isCliOwnedSkillName } from '../builtin-skills.js';
 import { resolveOpenclawWorkspaceDir } from '../openclaw-hooks.js';
 import { getHermesHome } from '../hermes-home.js';
 import { loadRolesManifest, resolveRoleResourceNamespaces } from '../roles.js';
@@ -15,8 +15,8 @@ import { splitFrontmatter, stringifyFrontmatter } from '../utils/frontmatter.js'
 /** File name used to track who has contributed (pushed) a skill. */
 const CONTRIBUTORS_FILE = 'CONTRIBUTORS';
 const SKILL_MD = 'SKILL.md';
-const CODEX_TOOL = 'codex';
-const SHARED_AGENT_SKILLS_PATH = '.agents/skills';
+export const CODEX_TOOL = 'codex';
+export const SHARED_AGENT_SKILLS_PATH = '.agents/skills';
 
 /** Prefer Codex's shared skill when that skill already lives there. */
 export async function resolveSkillDestination(
@@ -440,7 +440,7 @@ export class SkillsHandler extends ResourceHandler {
         if (tombstones.has(dir)) continue;
         if (pushIgnoredSkills.has(dir)) continue;
         if (blockedSkills.has(dir)) continue; // Skip skills in non-allowed namespaces
-        if (BUILTIN_SKILL_NAMES.has(dir)) continue; // Skip CLI built-in skills
+        if (isCliOwnedSkillName(dir)) continue; // Skip CLI built-in skills, current and legacy
         if (sourceSkillNames.has(dir)) continue; // Skip cross-team source skills
 
         if (teamSkills.has(dir)) {

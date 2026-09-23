@@ -38,7 +38,17 @@ import { agentStemFromFilename } from './resources/agent-format.js';
 import { resolveDocsDestination } from './resources/docs.js';
 import { listTeamAgentDirs } from './resources/agents.js';
 import { BUILTIN_AGENT_NAMES } from './builtin-agents.js';
-import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
+import {
+  BUILTIN_SKILL_NAMES,
+  LEGACY_BUILTIN_SKILL_NAMES,
+  ownedSkillFiles,
+  isCliOwnedSkillName,
+  prunedWhole,
+  removeOwnedFiles,
+  skillsGuardBase,
+} from './builtin-skills.js';
+import { getHermesHome } from './hermes-home.js';
+import { CODEX_TOOL, SHARED_AGENT_SKILLS_PATH } from './resources/skills.js';
 import {
   pathExists,
   readFileSafe,
@@ -83,8 +93,11 @@ interface RemovalPlan {
   hookManifestPath: string;
   /** CLAUDE.md files with teamai rules blocks. */
   claudeMdFiles: string[];
-  /** Skill directories synced from team repo. */
-  skillDirs: string[];
+  /**
+   * Skill directories synced from team repo, each with the base directory its
+   * skills root hangs off: the prune refuses a link anywhere below that base.
+   */
+  skillDirs: SkillDirEntry[];
   /** Rule .md files synced from team repo (plus CLI built-in rules). */
   ruleFiles: string[];
   /** Built-in agent .md files deployed by the CLI (e.g. teamai-recall). */
@@ -108,6 +121,12 @@ interface RemovalPlan {
 }
 
 /** Per-tool findings collected during discovery (tool-specific resources only). */
+/** A skill directory to remove, and the base the link guard starts from. */
+interface SkillDirEntry {
+  dir: string;
+  baseDir: string;
+}
+
 interface ToolResources {
   hookFiles: Array<{ path: string; tool: string; manifestPath: string }>;
   openclawHookDirs: Array<{ hooksDir: string; tool: string }>;
@@ -115,7 +134,7 @@ interface ToolResources {
   ompHookFile: string | null;
   dshHookFile: string | null;
   claudeMdFiles: string[];
-  skillDirs: string[];
+  skillDirs: SkillDirEntry[];
   ruleFiles: string[];
   agentFiles: string[];
 }
@@ -235,6 +254,8 @@ async function discoverToolResources(
   tool: string,
   toolPath: TeamaiConfig['toolPaths'][string],
   baseDir: string,
+  /** Home, or the project root: where the skills link guard starts (`skillsGuardBase`). */
+  scopeRoot: string,
   teamSkillNames: Set<string>,
   teamRuleNames: Set<string>,
   teamAgentNames: Set<string>,
@@ -344,17 +365,36 @@ async function discoverToolResources(
 
   // (c) Skills — only those matching team repo
   if (toolPath.skills) {
-    const skillRoots = new Set([path.join(baseDir, toolPath.skills)]);
+    // Skills root → the base the link guard starts from.
+    const configuredSkills = path.join(baseDir, toolPath.skills);
+    const skillRoots = new Map([[configuredSkills, skillsGuardBase(scopeRoot, configuredSkills)]]);
+    // OpenClaw and Hermes receive skills where team sync and the stub put them
+    // (`skillsDirForTool`): the workspace, and HERMES_HOME.
     if (tool === 'openclaw') {
       const workspaceDir = await resolveOpenclawWorkspaceDir();
-      if (workspaceDir) skillRoots.add(path.join(workspaceDir, 'skills'));
+      if (workspaceDir) {
+        const workspaceSkills = path.join(workspaceDir, 'skills');
+        skillRoots.set(workspaceSkills, skillsGuardBase(scopeRoot, workspaceSkills));
+      }
     }
-    for (const skillsDir of skillRoots) {
+    if (tool === 'hermes') {
+      const hermesSkills = path.join(getHermesHome(), 'skills');
+      skillRoots.set(hermesSkills, skillsGuardBase(scopeRoot, hermesSkills));
+    }
+    // `resolveSkillDestination` writes Codex's copy into the shared
+    // .agents/skills root whenever that skill already lives there, so uninstall
+    // must look where deployment could have put it — the legacy prune already
+    // does. Codex only: another tool's pass must not reach into it.
+    if (tool === CODEX_TOOL) {
+      const sharedSkills = path.join(baseDir, SHARED_AGENT_SKILLS_PATH);
+      skillRoots.set(sharedSkills, skillsGuardBase(scopeRoot, sharedSkills));
+    }
+    for (const [skillsDir, rootBase] of skillRoots) {
       if (await pathExists(skillsDir)) {
         const dirs = await listDirs(skillsDir);
         for (const dir of dirs) {
           if (teamSkillNames.has(dir)) {
-            res.skillDirs.push(path.join(skillsDir, dir));
+            res.skillDirs.push({ dir: path.join(skillsDir, dir), baseDir: rootBase });
           }
         }
       }
@@ -417,6 +457,9 @@ async function buildRemovalPlan(
   const repoPath = localConfig.repo.localPath;
   const teamSkillNames = await collectTeamSkillNames(repoPath);
   for (const name of BUILTIN_SKILL_NAMES) teamSkillNames.add(name);
+  // Directories earlier releases deployed: uninstall would otherwise leave the
+  // pre-stub skill trees behind on any machine that upgraded.
+  for (const name of LEGACY_BUILTIN_SKILL_NAMES) teamSkillNames.add(name);
   const teamRuleNames = await collectTeamRuleNames(repoPath);
   for (const name of BUILTIN_RULE_NAMES) teamRuleNames.add(name);
   const teamAgentNames = await collectTeamAgentNames(repoPath);
@@ -462,6 +505,7 @@ async function buildRemovalPlan(
         tool,
         toolPath,
         resolveToolBaseDir(tool, localConfig),
+        resolveBaseDir(localConfig),
         teamSkillNames,
         teamRuleNames,
         teamAgentNames,
@@ -667,8 +711,13 @@ function printSummary(plan: RemovalPlan, agentFilter?: string): void {
 
   if (plan.skillDirs.length > 0) {
     console.log(`   Skills (${plan.skillDirs.length} directories):`);
-    for (const skillDir of plan.skillDirs) {
-      console.log(`     ${skillDir}`);
+    for (const { dir: skillDir } of plan.skillDirs) {
+      // A CLI-owned directory loses the files TeamAI packaged, not whatever the
+      // member added beside them, so the prompt must not promise the directory.
+      const suffix = isCliOwnedSkillName(path.basename(skillDir))
+        ? '   (TeamAI-packaged files only; anything you added stays)'
+        : '';
+      console.log(`     ${skillDir}${suffix}`);
     }
     console.log('');
   }
@@ -829,16 +878,53 @@ async function executeRemoval(plan: RemovalPlan): Promise<void> {
     }
   }
 
-  // (c) Remove synced skills
-  for (const skillDir of plan.skillDirs) {
+  // (c) Remove synced skills.
+  //
+  // A team-repo skill is synced whole, so the whole directory goes. A CLI-owned
+  // one is not: deployment writes only the files in PACKAGED_SKILL_FILES and
+  // never touched a file a member added beside them, so uninstall removes those
+  // same paths and keeps the rest — the same ownership rule pull applies.
+  // Deleting the directory here would undo the guarantee one command over.
+  //
+  // Pull's archive is deliberately not applied: there the member is upgrading
+  // and did not ask for anything to go, here they asked for all of it. Leaving
+  // copies behind would be the thing they ran the command to avoid.
+  let removedSkillDirs = 0;
+  const keptSkillDirs: string[] = [];
+  const linkedSkillDirs: string[] = [];
+  const failedSkillDirs: { skillDir: string; first: { file: string; error: string } }[] = [];
+  for (const { dir: skillDir, baseDir } of plan.skillDirs) {
     try {
-      await remove(skillDir);
+      const name = path.basename(skillDir);
+      if (isCliOwnedSkillName(name)) {
+        const result = await removeOwnedFiles(skillDir, await ownedSkillFiles(name), baseDir);
+        if (prunedWhole(result)) removedSkillDirs++;
+        else if (result.skippedSymlink) linkedSkillDirs.push(skillDir);
+        // A delete that failed is not a member's file: say what happened, not
+        // "the packaged files were removed".
+        else if (result.notRemoved.length > 0) failedSkillDirs.push({ skillDir, first: result.notRemoved[0] });
+        else keptSkillDirs.push(skillDir);
+      } else {
+        await remove(skillDir);
+        removedSkillDirs++;
+      }
     } catch (e) {
       log.warn(`Failed to remove skill ${skillDir}: ${(e as Error).message}`);
     }
   }
-  if (plan.skillDirs.length > 0) {
-    log.success(`Removed ${plan.skillDirs.length} skill directories`);
+  if (removedSkillDirs > 0) {
+    log.success(`Removed ${removedSkillDirs} skill directories`);
+  }
+  for (const skillDir of keptSkillDirs) {
+    log.warn(`Kept ${skillDir}: it holds files TeamAI did not put there. The packaged files were removed; delete the rest yourself once you have saved what you need.`);
+  }
+  // A different reason, so a different sentence: nothing here was touched, and
+  // "delete the rest yourself" would send the member into the link target.
+  for (const skillDir of linkedSkillDirs) {
+    log.warn(`Kept ${skillDir}: it is reached through a symlink, so TeamAI left it and whatever the link points at alone.`);
+  }
+  for (const { skillDir, first } of failedSkillDirs) {
+    log.warn(`Could not delete packaged files under ${skillDir}. First: ${first.file} — ${first.error}. Fix the permissions and run \`teamai uninstall\` again, or delete the directory yourself.`);
   }
 
   // (d) Remove synced rules

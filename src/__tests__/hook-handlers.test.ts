@@ -77,7 +77,9 @@ vi.mock('../update.js', () => ({
 
 const mockAutoDetectInit = vi.fn().mockResolvedValue({
   localConfig: { repo: { localPath: '/tmp', remote: '' }, username: 'test', scope: 'user' },
-  teamConfig: { team: 'test', repo: '', toolPaths: {} },
+  // Recall on: the contribute hint routes to the share workflow, which is
+  // refused while recall is off, so the hint is withheld there too.
+  teamConfig: { team: 'test', repo: '', toolPaths: {}, sharing: { recall: { enabled: true } } },
 });
 
 vi.mock('../config.js', async (importOriginal) => ({
@@ -369,7 +371,7 @@ describe('hook-handlers registry', () => {
     )!.handler;
     mockAutoDetectInit.mockResolvedValueOnce({
       localConfig: { repo: { localPath: '/tmp', remote: '' }, username: 'test', scope: 'user', contributeHintEnabled: true },
-      teamConfig: { team: 'test', repo: '', toolPaths: {}, sharing: { contributeHint: { enabled: false } } },
+      teamConfig: { team: 'test', repo: '', toolPaths: {}, sharing: { contributeHint: { enabled: false }, recall: { enabled: true } } },
     });
     mockContributeCheckForSession.mockResolvedValueOnce({ hint: '[teamai] do share' });
 
@@ -377,16 +379,63 @@ describe('hook-handlers registry', () => {
     expect(result).toContain('do share');
   });
 
-  it('contribute-check handler keeps hinting when config cannot be loaded', async () => {
+  it('contribute-check handler stays silent while recall is off, since `teamai skill get share` would refuse', async () => {
     const registry = buildHandlerRegistry();
     const handler = registry.find(
       (r) => r.event === 'stop' && r.handler.name === 'contribute-check',
     )!.handler;
-    mockAutoDetectInit.mockRejectedValueOnce(new Error('not initialized'));
+    mockAutoDetectInit.mockResolvedValueOnce({
+      localConfig: { repo: { localPath: '/tmp', remote: '' }, username: 'test', scope: 'user' },
+      teamConfig: { team: 'test', repo: '', toolPaths: {} },
+    });
+    mockContributeCheckForSession.mockClear();
+
+    const result = await handler.execute({ session_id: 's3b', cwd: '/x' }, 'claude');
+    expect(result).toBeNull();
+    expect(mockContributeCheckForSession).not.toHaveBeenCalled();
+  });
+
+  it('contribute-check handler stays silent on a read-only HTTP source even with recall on', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'contribute-check',
+    )!.handler;
+    mockAutoDetectInit.mockResolvedValueOnce({
+      localConfig: { repo: { kind: 'http', localPath: '/tmp', remote: '' }, username: 'test', scope: 'user' },
+      teamConfig: { team: 'test', repo: '', toolPaths: {}, sharing: { recall: { enabled: true } } },
+    });
+    mockContributeCheckForSession.mockClear();
+
+    const result = await handler.execute({ session_id: 's3c', cwd: '/x' }, 'claude');
+    expect(result).toBeNull();
+    expect(mockContributeCheckForSession).not.toHaveBeenCalled();
+  });
+
+  it('contribute-check handler keeps hinting when there is no config at all', async () => {
+    const { NotInitializedError } = await import('../config.js');
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'contribute-check',
+    )!.handler;
+    mockAutoDetectInit.mockRejectedValueOnce(new NotInitializedError('teamai is not initialized. Run `teamai init` first.'));
     mockContributeCheckForSession.mockResolvedValueOnce({ hint: '[teamai] do share' });
 
     const result = await handler.execute({ session_id: 's5', cwd: '/x' }, 'claude');
     expect(result).toContain('do share');
+  });
+
+  it('contribute-check handler stays silent when a config exists but cannot be loaded', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'contribute-check',
+    )!.handler;
+    // `teamai skill get share` refuses on such a config, so the nudge would lead nowhere.
+    mockAutoDetectInit.mockRejectedValueOnce(new Error('Team config (teamai.yaml) not found. Check your repo path.'));
+    mockContributeCheckForSession.mockClear();
+
+    const result = await handler.execute({ session_id: 's5b', cwd: '/x' }, 'claude');
+    expect(result).toBeNull();
+    expect(mockContributeCheckForSession).not.toHaveBeenCalled();
   });
 
   it('contribute-check handler obeys TEAMAI_CONTRIBUTE_HINT_DISABLED=1', async () => {
