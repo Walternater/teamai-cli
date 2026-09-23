@@ -15,7 +15,11 @@ do not skip, reorder, or invent commands.
 
 Look at what the user typed after `/teamai`.
 
-**If they gave NO scenario** (bare `/teamai`, or only greetings/no task):
+**If they gave NO scenario right after a TeamAI friction reminder** (the
+`[teamai]` line that suggests `/teamai share what this session taught me`),
+that reminder is the scenario: load `teamai skill get share` and follow it.
+
+**If they gave NO scenario otherwise** (bare `/teamai`, or only greetings/no task):
 print the menu below **exactly**, then **STOP and wait**. Take no other action —
 do not run any command, do not load another skill yet.
 
@@ -62,7 +66,8 @@ Sharing a session's learnings needs no menu choice: TeamAI prompts on its own at
 the end of a session that produced something worth sharing, and that prompt means
 `teamai skill get share`. (Only when recall is on; it is off by default. The team turns it on with
 `sharing.recall.enabled: true` in `teamai.yaml`, a member with `teamai recall enable`;
-while it is off, `teamai skill get share` says so.)
+while it is off, or while the teamai config cannot be loaded, `teamai skill get share`
+says so and why.)
 
 ## Global rules
 

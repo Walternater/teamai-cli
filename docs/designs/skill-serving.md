@@ -94,14 +94,17 @@ path (measured here from a 77-character one).
   blocks instead (`blockedBy: "config"`), since recall and the source are then
   unknown and the workflow would fail at `teamai contribute` — a project config
   too, which detection alone would skip in favour of the user config
-  (`findUnreadableProjectConfig`). The Stop-hook share reminder is gated the same
-  way (`contributeHintAllowed`, `src/hook-handlers.ts`), because it points at this
-  command, with one difference: with no config at all it stays silent. The hook
-  fires in every project on the machine, and a directory without teamai has no
-  team to share with (#748). The gate lives in one place:
-  `resolveServableSkill` (`src/skill-content.ts`) is the only way to obtain a
-  packaged skill outside that module, and it returns `blocked` instead of the
-  skill, so a command cannot print a directory it never received.
+  (`findUnreadableProjectConfig`), including one that is not `scope: project`. The refusal then says what failed (for a file
+  that does not parse, which file and where; for one that fails validation,
+  which field and why), since nothing else reports it. The
+  Stop-hook share reminder asks the same gate (`contributeHintAllowed`, called
+  by the hook dispatcher and by the legacy `teamai contribute-check`), because it
+  points at this command, with one difference: with no config at all it stays
+  silent. The hook fires in every project on the machine, and a directory without
+  teamai has no team to share with (#748). The gate lives in one place: `shareGate`
+  (`src/skill-content.ts`) decides it, and `resolveServableSkill` is the only
+  way to obtain a packaged skill outside that module; it returns `blocked`
+  instead of the skill, so a command cannot print a directory it never received.
 - **`skill path` takes a name, always,** and a blocked name gets the same
   refusal as `skill get`. The gate routes the agent away from a workflow that
   cannot finish; it is not access control, since the files ship in the package.
@@ -109,7 +112,10 @@ path (measured here from a 77-character one).
   team repo, then the installed agents, then the package. `codebase`, `default`,
   `learning` and `share` are ordinary names: a directory a member created under
   one of them is the skill they are asking about, and the recall gate does not
-  apply to it. The two legacy directory names are the exception, by design:
+  apply to it. A config that cannot be loaded does apply: which team repo and
+  agents are meant is then unknown (`detectTeam`), so `skill show` searches
+  neither, refuses `share`, and answers any other name from the package alone,
+  saying what failed. The two legacy directory names are the exception, by design:
   `team-wiki-codebase` and `teamai-share-learnings` classify as `[builtin]` and
   are skipped by the push scan by name alone (`isCliOwnedSkillName`), because a
   tree with that name is one a pre-stub release wrote until the first pull has
@@ -121,6 +127,8 @@ path (measured here from a 77-character one).
 - **`skill list` needs no team.** The human-readable listing prints the packaged
   catalog even before `teamai init`, with a hint for the team half, so a fresh
   machine can discover what the installed CLI serves the way `skill get` lets it.
+  With a config that cannot be loaded it prints the catalog too, but no team
+  listing, says what failed on stderr, and exits 1.
 
 
 ## Drift guards
@@ -132,8 +140,9 @@ Two tests, both in the unit suite:
   `npx vitest run commands-reference -u`.
 - `skill-commands-exist.test.ts` resolves every `teamai …` string written
   anywhere under `skill-data/` against that same table, and fails on an unknown
-  command or flag. It carries a case proving it catches `teamai extract graph`,
-  the command the wiki skill advertised for four releases.
+  command, subcommand or flag. It carries cases proving it catches
+  `teamai extract graph`, the command the wiki skill advertised for four
+  releases, and a misspelled subcommand inside a group (`teamai skill gett`).
 
 A third, in `skill-content.test.ts`, asserts through `npm pack` that both
 `skills/` and `skill-data/` are in the published tarball. Without it, a missing
@@ -237,7 +246,8 @@ and can be dropped on the same schedule.
 `/teamai-share-learnings` was never a deployed slash command in its own right —
 it existed because the directory was installed. The Stop-hook nudge now names
 `/teamai share what this session taught me`, an invocation the core skill routes
-to `share` (bare `/teamai` prints the menu and stops), and carries
+to `share` (so does a bare `/teamai` typed right after the reminder; otherwise
+bare `/teamai` prints the menu and stops), and carries
 `teamai skill get share` literally, so an agent can act on it even without
-inferring the intent. It is withheld while recall is off, because that command
-refuses then.
+inferring the intent. It is withheld wherever that command refuses (recall off,
+a read-only HTTP source, a config that cannot be loaded).

@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 // ── Mocks ────────────────────────────────────────────────
 // Mock the underlying modules so handlers don't do real I/O
@@ -82,9 +85,15 @@ const mockAutoDetectInit = vi.fn().mockResolvedValue({
   teamConfig: { team: 'test', repo: '', toolPaths: {}, sharing: { recall: { enabled: true } } },
 });
 
+const mockFindUnreadableProjectConfig = vi.fn().mockResolvedValue(null);
+
 vi.mock('../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../config.js')>()),
   autoDetectInit: mockAutoDetectInit,
+  // A payload cwd that no longer exists (these tests use '/x') holds no
+  // project config, so the gate asks the user config: the same mocked one.
+  requireInit: mockAutoDetectInit,
+  findUnreadableProjectConfig: mockFindUnreadableProjectConfig,
   resolveConfigForDir: vi.fn().mockResolvedValue({
     repo: { localPath: '/tmp/team-repo', remote: '' }, username: 'test', scope: 'user', additionalRoles: [],
   }),
@@ -92,6 +101,7 @@ vi.mock('../config.js', async (importOriginal) => ({
 
 vi.mock('../utils/logger.js', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  setStderrOnly: vi.fn().mockReturnValue(false),
 }));
 
 vi.mock('../local-agent.js', () => ({
@@ -414,7 +424,8 @@ describe('hook-handlers registry', () => {
     expect(mockContributeCheckForSession).not.toHaveBeenCalled();
   });
 
-  it('contribute-check handler stays silent when there is no config at all (#748)', async () => {
+  it('contribute-check handler stays silent when there is no config at all', async () => {
+    // A project that never set up teamai has no team to share with (#748).
     const { NotInitializedError } = await import('../config.js');
     const registry = buildHandlerRegistry();
     const handler = registry.find(
@@ -425,6 +436,77 @@ describe('hook-handlers registry', () => {
     mockContributeCheckForSession.mockClear();
 
     const result = await handler.execute({ session_id: 's5', cwd: '/x' }, 'claude');
+    expect(result).toBeNull();
+    expect(mockContributeCheckForSession).not.toHaveBeenCalled();
+  });
+
+  it('contribute-check handler stays silent when the project config is unreadable, even if the user config loads', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'contribute-check',
+    )!.handler;
+    // Detection skips the broken project file and loads the user config (recall
+    // on), but `teamai skill get share` refuses here, so the nudge would lead nowhere.
+    mockFindUnreadableProjectConfig.mockResolvedValueOnce('/x/.teamai/config.yaml: bad indentation');
+    mockContributeCheckForSession.mockClear();
+
+    // An existing directory: a deleted one holds no project config to be unreadable.
+    const result = await handler.execute({ session_id: 's5c', cwd: process.cwd() }, 'claude');
+    expect(result).toBeNull();
+    expect(mockContributeCheckForSession).not.toHaveBeenCalled();
+  });
+
+  it('contribute-check handler asks the gate about the payload cwd, not the directory the process is in', async () => {
+    // hook-dispatch changes into the payload cwd, but that can fail; the gate
+    // must not then read wherever the process started.
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'contribute-check',
+    )!.handler;
+    mockFindUnreadableProjectConfig.mockImplementation(async (cwd?: string) =>
+      cwd === undefined ? '/launcher/.teamai/config.yaml: bad indentation' : null);
+    mockContributeCheckForSession.mockResolvedValueOnce({ hint: '[teamai] do share' });
+    try {
+      const result = await handler.execute({ session_id: 's5e', cwd: process.cwd() }, 'claude');
+      expect(result).toContain('do share');
+    } finally {
+      mockFindUnreadableProjectConfig.mockReset();
+      mockFindUnreadableProjectConfig.mockResolvedValue(null);
+    }
+  });
+
+  it('contribute-check handler withholds the reminder when the payload cwd exists but cannot be checked', async () => {
+    // Only a cwd that is gone (ENOENT) falls back to the user config; one that
+    // cannot be opened, here a path through a file (ENOTDIR), is unknown.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-hook-cwd-'));
+    const file = path.join(dir, 'a-file');
+    fs.writeFileSync(file, '');
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'contribute-check',
+    )!.handler;
+    mockContributeCheckForSession.mockClear();
+    try {
+      const result = await handler.execute({ session_id: 's5f', cwd: path.join(file, 'sub') }, 'claude');
+      expect(result).toBeNull();
+      expect(mockContributeCheckForSession).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('contribute-check handler withholds the reminder, without failing the turn, when the gate itself faults', async () => {
+    const registry = buildHandlerRegistry();
+    const handler = registry.find(
+      (r) => r.event === 'stop' && r.handler.name === 'contribute-check',
+    )!.handler;
+    mockAutoDetectInit.mockResolvedValueOnce({
+      localConfig: { get repo(): never { throw new TypeError('a bug past the config load'); } },
+      teamConfig: { team: 'test', repo: '', toolPaths: {}, sharing: { recall: { enabled: true } } },
+    });
+    mockContributeCheckForSession.mockClear();
+
+    const result = await handler.execute({ session_id: 's5d', cwd: '/x' }, 'claude');
     expect(result).toBeNull();
     expect(mockContributeCheckForSession).not.toHaveBeenCalled();
   });

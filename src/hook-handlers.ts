@@ -136,8 +136,7 @@ const updateHandler: HookHandler = {
 /**
  * Team course-correction keywords for the current project. The dispatcher has
  * already chdir'd to the hook payload's cwd (hook-dispatch-cli), so
- * autoDetectInit() resolves the right project, as it does for
- * contributeHintAllowed. Only prompt hooks pay for the config read; an
+ * autoDetectInit() resolves the right project. Only prompt hooks pay for the config read; an
  * unreadable config means "built-in keywords only".
  */
 async function teamCorrectionKeywords(stdin: Record<string, unknown>): Promise<readonly string[]> {
@@ -243,32 +242,6 @@ const trackSlashHandler: HookHandler = {
   },
 };
 
-/**
- * Whether the share-learnings hint may be emitted at all. Resolved lazily per
- * hook run so a team can switch it off via teamai.yaml (or a member via local
- * config) without re-injecting hooks. Withheld when there is no config at all:
- * the hook fires in every project on the machine, and a directory without teamai
- * has no team to share with (#748). A config that exists but cannot be loaded
- * withholds it too: `share` refuses there, so the nudge would lead nowhere.
- *
- * Recall and a writable source gate it too: the hint routes to the `share`
- * workflow, and `teamai skill get share` refuses while recall is off or the
- * team source is read-only HTTP, so a nudge towards it would send the agent to
- * a command that says no. The dispatcher already drops this `gitOnly` handler
- * for HTTP teams; the check here keeps the gate the same wherever it is called.
- */
-async function contributeHintAllowed(): Promise<boolean> {
-  const { isContributeHintEnabled, isRecallEnabled } = await import('./types.js');
-  const { autoDetectInit } = await import('./config.js');
-  try {
-    const { localConfig, teamConfig } = await autoDetectInit();
-    return localConfig.repo?.kind !== 'http'
-      && isContributeHintEnabled(localConfig, teamConfig)
-      && isRecallEnabled(localConfig, teamConfig);
-  } catch {
-    return false;
-  }
-}
 
 /**
  * Ask the model to declare which recalled documents it actually used.
@@ -289,7 +262,10 @@ export function buildVotesNudge(recalledDocIds: readonly string[]): string {
 const contributeCheckHandler: HookHandler = {
   name: 'contribute-check',
   async execute(stdin, tool) {
-    if (!(await contributeHintAllowed())) return null;
+    // The payload's cwd, not the process's: hook-dispatch changes into it, but
+    // that can fail, and the gate must not then read the launcher's directory.
+    const { contributeHintAllowed } = await import('./skill-content.js');
+    if (!(await contributeHintAllowed(resolveHookCwd(stdin)))) return null;
 
     const { contributeCheckForSession } = await import('./contribute-check.js');
     const { formatStopHookOutput, relayWhenHidden } = await import('./utils/hook-output.js');
@@ -331,7 +307,8 @@ const pendingHintHandler: HookHandler = {
     // Always consume the stash so a hint stashed before the team turned the
     // feature off is not delivered later when it is turned back on.
     const stashed = await pending.takePendingHint(sessionId);
-    const hint = (await contributeHintAllowed()) ? stashed : null;
+    const { contributeHintAllowed } = await import('./skill-content.js');
+    const hint = (await contributeHintAllowed(resolveHookCwd(stdin))) ? stashed : null;
     const votesHint = await pending.takePendingVotesHint(sessionId);
 
     // The votes nudge instructs the model; the contribute hint asks it to relay

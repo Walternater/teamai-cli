@@ -1,13 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { autoDetectInit, logDim, NotInitializedError } = vi.hoisted(() => ({
+const { autoDetectInit, findUnreadableProjectConfig, logDim, logError, NotInitializedError } = vi.hoisted(() => ({
   autoDetectInit: vi.fn(),
+  findUnreadableProjectConfig: vi.fn(),
   logDim: vi.fn(),
+  logError: vi.fn(),
   NotInitializedError: class NotInitializedError extends Error {},
 }));
-vi.mock('../config.js', () => ({ autoDetectInit, NotInitializedError }));
+vi.mock('../config.js', () => ({
+  autoDetectInit,
+  findUnreadableProjectConfig,
+  requireInit: vi.fn(),
+  NotInitializedError,
+  BROKEN_CONFIG_ADVICE: 'Fix the file, or move it aside and run `teamai init` to write a new one.',
+}));
 vi.mock('../utils/logger.js', () => ({
-  log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: logDim },
+  log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: logError, debug: vi.fn(), dim: logDim },
   setStderrOnly: vi.fn(() => false),
 }));
 
@@ -25,7 +33,11 @@ describe('teamai skill list before init', () => {
   beforeEach(() => {
     stdout = '';
     autoDetectInit.mockReset();
+    // No project config under the test's cwd: detection goes on to autoDetectInit.
+    findUnreadableProjectConfig.mockReset();
+    findUnreadableProjectConfig.mockResolvedValue(null);
     logDim.mockReset();
+    logError.mockReset();
     logSpy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
       stdout += args.join(' ') + '\n';
     });
@@ -54,7 +66,33 @@ describe('teamai skill list before init', () => {
     // member to run `teamai init` would send them to re-init over a real setup.
     autoDetectInit.mockRejectedValue(new Error('Team config (teamai.yaml) not found. Check your repo path.'));
 
-    await expect(skillList({})).rejects.toThrow('Team config (teamai.yaml) not found');
+    await skillList({});
+
+    expect(process.exitCode).toBe(1);
+    expect(logError).toHaveBeenCalledWith(expect.stringContaining('Team config (teamai.yaml) not found'));
     expect(logDim).not.toHaveBeenCalledWith(expect.stringContaining('Not initialized'));
+    // The packaged catalog needs no team, so it is still listed.
+    expect(stdout).toContain('teamai skill get core');
+  });
+
+  it('loads the config once, so a broken one is reported once', async () => {
+    autoDetectInit.mockRejectedValue(new Error('The teamai config at /h/.teamai/config.yaml could not be read: it is empty.'));
+
+    await skillList({});
+
+    expect(autoDetectInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not list the team the user config names while the project config is unreadable', async () => {
+    // Detection skips the broken project file and would answer with the user
+    // config: another team's repo.
+    findUnreadableProjectConfig.mockResolvedValue('/work/proj/.teamai/config.yaml: bad indentation');
+
+    await skillList({});
+
+    expect(autoDetectInit).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
+    expect(logError).toHaveBeenCalledWith(expect.stringContaining('/work/proj/.teamai/config.yaml: bad indentation'));
+    expect(stdout).toContain('teamai skill get core');
   });
 });

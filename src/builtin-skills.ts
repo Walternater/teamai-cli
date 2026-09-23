@@ -445,7 +445,10 @@ export async function pruneLegacyBuiltinSkills(
           log.warn(`Kept "${legacyName}" (${tool}): ${dir} holds files TeamAI did not put there. The packaged files were removed${saved}; delete the rest yourself once you have saved what you need.`);
         }
       } catch (e) {
-        log.debug(`Could not remove legacy built-in skill ${legacyName} from ${tool}: ${(e as Error).message}`);
+        const message = `Could not finish removing "${legacyName}" (${tool}) from ${dir}: ${e instanceof Error ? e.message : String(e)}. Whatever is left there stays until the next pull, which tries again.`;
+        log.warn(message);
+        // A detached SessionStart pull discards its output; debug.log keeps the record.
+        log.persist(message);
       }
     }
   }
@@ -517,7 +520,8 @@ export async function deployBuiltinSkills(teamConfig: TeamaiConfig, localConfig?
   let entries: string[];
   try {
     entries = await fs.promises.readdir(builtinDir);
-  } catch {
+  } catch (e) {
+    log.debug(`Could not list the built-in skills in ${builtinDir}, skipping deployment: ${e instanceof Error ? e.message : String(e)}`);
     return 0;
   }
 
@@ -530,7 +534,10 @@ export async function deployBuiltinSkills(teamConfig: TeamaiConfig, localConfig?
     }
   }
 
-  if (skillNames.length === 0) return 0;
+  if (skillNames.length === 0) {
+    log.debug(`No built-in skill in ${builtinDir} has a SKILL.md, skipping deployment`);
+    return 0;
+  }
 
   let deployed = 0;
 

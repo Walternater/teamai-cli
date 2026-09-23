@@ -717,6 +717,12 @@ export async function contributeCheck(toolArg?: string): Promise<void> {
     return;
   }
 
+  // The same gate as the dispatcher's handler: hooks written before it still
+  // call this command, and must not nudge towards a `share` that refuses. It
+  // is asked about the session's cwd, never the one this process started in.
+  const { contributeHintAllowed } = await import('./skill-content.js');
+  if (!(await contributeHintAllowed(stdinData.cwd))) return;
+
   const { stopStdoutUnsupported } = await import('./utils/tool-names.js');
   const tool = toolArg?.toLowerCase() ?? 'claude';
   const { hint } = await contributeCheckForSession(
