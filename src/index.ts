@@ -1,6 +1,7 @@
 import { createRequire } from 'node:module';
 import { Command, Option } from 'commander';
 import { setVerbose, setSilent, log } from './utils/logger.js';
+import { applyNonInteractiveGitEnv } from './utils/git-env.js';
 import type { GlobalOptions, LocalConfig } from './types.js';
 import { TEAMAI_HOOK_SUBCOMMANDS } from './hooks.js';
 import { registerPackagesCommand } from './pkg/register-command.js';
@@ -26,6 +27,13 @@ async function notifyWebhook(event: 'push' | 'pull'): Promise<void> {
     // Best-effort notification; never surface to the user.
   }
 }
+
+// Without a person at a terminal, no git child may stop to ask for a
+// credential: a terminal prompt, an askpass dialog or a credential manager
+// window all park the run with no output. A missing credential should fail the
+// clone at once instead (issue #711). See utils/git-env.ts for each door, and
+// for why ssh's own questions are left to the repository's configuration.
+applyNonInteractiveGitEnv();
 
 const program = new Command();
 
