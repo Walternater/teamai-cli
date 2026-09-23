@@ -1158,11 +1158,19 @@ export async function removeHooks(settingsPath: string, tool?: string): Promise<
  * Report whether the current built-in (A) hook set is present in a tool settings
  * file. Computed against the unified HookDef model: every built-in entry for the
  * tool must already exist on disk.
+ *
+ * `builtinOverride` is the team's §4.8 override. Reconciliation applies it when
+ * writing, so the status check must apply it too — otherwise a hook the team
+ * disabled is still expected on disk and every tool reads as `missing`.
  */
-export async function getHookStatus(settingsPath: string, tool?: string): Promise<HookStatus> {
+export async function getHookStatus(
+  settingsPath: string,
+  tool?: string,
+  builtinOverride?: BuiltinHookOverride,
+): Promise<HookStatus> {
   const toolName = tool ?? 'claude';
   const expanded = expandHome(settingsPath);
-  const defs = builtinHookDefs(toolName);
+  const defs = applyBuiltinOverride(builtinHookDefs(toolName), builtinOverride);
 
   const format = detectFormat(toolName);
   if (format === 'cursor') {
@@ -1479,6 +1487,29 @@ export async function reconcileHooksToAllTools(
         }
       } catch (e) {
         log.warn(`Failed to reconcile Hermes hooks: ${(e as Error).message}`);
+      }
+      continue;
+    }
+    // OpenClaw has no settings hook list either: its hook is a HOOK.md +
+    // handler.ts pair under the resolved workspace dir. Route it to that
+    // adapter, which no-ops when the workspace cannot be resolved, so an
+    // uninstalled OpenClaw never grows a config dir. Only `openclaw` itself:
+    // resolveOpenclawWorkspaceDir resolves the OpenClaw workspace, so routing
+    // the other claw variants here would make them overwrite that one handler
+    // with each other's --tool value.
+    if (tool === 'openclaw') {
+      if (opts.settingsOnly) continue;
+      try {
+        if (opts.removeAll) {
+          const { removeOpenClawHooks, resolveOpenclawWorkspaceDir } = await import('./openclaw-hooks.js');
+          const wsDir = await resolveOpenclawWorkspaceDir();
+          if (wsDir) await removeOpenClawHooks(path.join(wsDir, 'hooks'));
+        } else {
+          const { injectOpenClawHooks } = await import('./openclaw-hooks.js');
+          await injectOpenClawHooks(undefined, tool);
+        }
+      } catch (e) {
+        log.warn(`Failed to reconcile OpenClaw hooks for ${tool}: ${(e as Error).message}`);
       }
       continue;
     }

@@ -1,10 +1,10 @@
 import path from 'node:path';
 import { autoDetectInit } from './config.js';
 import { reconcileHooks, reconcileHooksToAllTools, reconcileTeamHooksForConfig, sweepLegacyProjectHooks, getHookStatus, hasInstalledCodexTrustGatedTool, codexTrustReminder, type HookStatus } from './hooks.js';
-import { builtinHookDefs } from './builtin-hooks.js';
-import { parseTeamHooks } from './resources/hooks.js';
+import { applyBuiltinOverride, installedBuiltinHookDefs } from './builtin-hooks.js';
+import { parseTeamHooksConfig } from './resources/hooks.js';
 import { log } from './utils/logger.js';
-import type { GlobalOptions } from './types.js';
+import type { GlobalOptions, HookDef } from './types.js';
 import {
     COPILOT_TOOL_ID,
     getManagedHooksPath,
@@ -22,6 +22,8 @@ interface HookListRow {
     tool: string;
     status: HookListStatus;
     settingsPath: string;
+    /** Built-in hooks this tool really receives (empty = no hook surface). */
+    builtinDefs: HookDef[];
 }
 
 function formatDisplayPath(settingsPath: string): string {
@@ -50,6 +52,40 @@ function formatHooksList(rows: HookListRow[]): string {
     }
 
     return lines.join('\n');
+}
+
+/**
+ * Generated files an adapter-driven tool's built-in hooks live in, or null when
+ * the tool is reconciled through a settings file (or its target location cannot
+ * be resolved, e.g. no OpenClaw workspace on this machine). The tool counts as
+ * installed only when every one of them is present, so a half-written
+ * installation does not read as `installed`.
+ */
+async function adapterHookArtifacts(tool: string): Promise<string[] | null> {
+    if (tool === 'omp') {
+        const { resolveOmpExtensionsDir, OMP_HOOK_FILE } = await import('./omp-hooks.js');
+        return [path.join(resolveOmpExtensionsDir(), OMP_HOOK_FILE)];
+    }
+    if (tool === 'opencode') {
+        // reconcileOpencodePlugin always installs the single plugin under the
+        // user path, whatever the config scope, so probe there.
+        const { resolveOpencodePluginDir, OPENCODE_HOOK_FILE } = await import('./opencode-hooks.js');
+        return [path.join(resolveOpencodePluginDir(getUserHome(), 'user'), OPENCODE_HOOK_FILE)];
+    }
+    if (tool === 'hermes') {
+        const { getReportScriptPath } = await import('./hermes-hooks.js');
+        return [getReportScriptPath()];
+    }
+    if (tool === 'openclaw') {
+        const { resolveOpenclawWorkspaceDir, OPENCLAW_HOOK_DIR } = await import('./openclaw-hooks.js');
+        const workspace = await resolveOpenclawWorkspaceDir();
+        if (!workspace) return null;
+        // The engine needs both halves: the HOOK.md descriptor and the handler
+        // it points at.
+        const dir = path.join(workspace, 'hooks', OPENCLAW_HOOK_DIR);
+        return [path.join(dir, 'HOOK.md'), path.join(dir, 'handler.ts')];
+    }
+    return null;
 }
 
 /**
@@ -95,6 +131,10 @@ export async function hooksList(_options: GlobalOptions): Promise<void> {
     // `~/.qoder-cn` vs `<root>/.qoder`) would otherwise be probed in the *other*
     // build's file and always reported missing.
     const hookScopedPaths = scopedToolPaths(teamConfig, { ...localConfig, scope: hookScope });
+    // The team's `builtin:` block can disable built-in hooks (§4.8); the
+    // reconcile engine applies it, so the listing must too or it shows hooks
+    // that were just removed from the settings files.
+    const { defs: teamDefs, builtin: builtinOverride } = await parseTeamHooksConfig(localConfig.repo.localPath);
     const rows: HookListRow[] = [];
     // One settings file is one install, so list it once, for the target that owns
     // it — the same rule the write path applies. Qoder CN shares Qoder's project
@@ -121,39 +161,72 @@ export async function hooksList(_options: GlobalOptions): Promise<void> {
             if (seenSettingsFiles.has(hookPath)) continue;
             seenSettingsFiles.add(hookPath);
         }
-        // OMP has no settings/hooks file to parse: its hooks are a single
-        // generated extension under the user agent dir, so presence of the
-        // file (with our marker) is the whole status.
-        if (tool === 'omp') {
-            const { resolveOmpExtensionsDir, OMP_HOOK_FILE } = await import('./omp-hooks.js');
-            const extFile = path.join(resolveOmpExtensionsDir(), OMP_HOOK_FILE);
+        // The adapter-driven tools have no settings/hooks file to parse: each
+        // installs a single generated artifact, so its presence is the whole
+        // status.
+        const artifacts = await adapterHookArtifacts(tool);
+        if (artifacts) {
+            const present = await Promise.all(artifacts.map((file) => pathExists(file)));
             rows.push({
                 tool,
-                status: await pathExists(extFile) ? 'installed' : 'missing',
-                settingsPath: formatDisplayPath(extFile),
+                status: present.every(Boolean) ? 'installed' : 'missing',
+                settingsPath: formatDisplayPath(artifacts[0] as string),
+                builtinDefs: installedBuiltinHookDefs(tool, false),
             });
             continue;
         }
         if (!hookPath) {
-            rows.push({ tool, status: 'not configured', settingsPath: 'no settings configured' });
+            rows.push({
+                tool,
+                status: 'not configured',
+                settingsPath: 'no settings configured',
+                builtinDefs: installedBuiltinHookDefs(tool, false),
+            });
             continue;
         }
         rows.push({
             tool,
-            status: await getHookStatus(hookPath, tool),
+            status: await getHookStatus(hookPath, tool, builtinOverride),
             settingsPath: formatDisplayPath(hookPath),
+            // The override is applied to the settings-driven defs only: the
+            // standalone adapters generate a fixed handler and ignore it, so
+            // filtering their rows would hide hooks they still install.
+            builtinDefs: applyBuiltinOverride(installedBuiltinHookDefs(tool, true), builtinOverride),
         });
     }
 
     console.log(formatHooksList(rows));
 
-    const teamDefs = await parseTeamHooks(localConfig.repo.localPath);
-
     console.log('');
-    console.log('Built-in hooks (A) — teamai operational (injected into every tool):');
-    for (const d of builtinHookDefs('claude')) {
-        const matcher = d.matcher && d.matcher !== '*' ? ` [${d.matcher}]` : '';
-        console.log(`  ${d.event}${matcher}  →  ${d.command}`);
+    console.log('Built-in hooks (A) — teamai operational, per tool:');
+    // The built-in set is per tool, not universal: Copilot carries an extra
+    // SessionEnd entry, the dispatch command differs for ZCode (raw) and the
+    // shell-dependent GUI tools (PATH wrapper), and the standalone adapters
+    // (Hermes, OMP, OpenClaw) install only part of the set. Rendering one
+    // hardcoded tool's set both hid hooks that `hooks inject` really installs
+    // and advertised hooks tools without that surface never receive (#717), so
+    // tools with no built-in hooks at all are omitted here. Tools whose set is
+    // identical once the tool id is folded out share one block, so the listing
+    // stays short instead of repeating the same rows per tool.
+    const builtinGroups = new Map<string, { tools: string[]; lines: string[] }>();
+    for (const { tool, builtinDefs } of rows) {
+        if (builtinDefs.length === 0) continue;
+        const lines = builtinDefs.map((d) => {
+            const matcher = d.matcher && d.matcher !== '*' ? ` [${d.matcher}]` : '';
+            const command = d.command.split(`--tool ${tool}`).join('--tool <tool>');
+            return `    ${d.event}${matcher}  →  ${command}`;
+        });
+        const key = lines.join('\n');
+        const group = builtinGroups.get(key);
+        if (group) group.tools.push(tool);
+        else builtinGroups.set(key, { tools: [tool], lines });
+    }
+    if (builtinGroups.size === 0) {
+        console.log('  (none)');
+    }
+    for (const group of builtinGroups.values()) {
+        console.log(`  ${group.tools.join(', ')}:`);
+        for (const line of group.lines) console.log(line);
     }
 
     console.log('');
