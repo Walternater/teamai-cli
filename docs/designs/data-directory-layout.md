@@ -118,14 +118,23 @@ is a P1 concern. This keeps P0 independently reviewable (issue R7).
    processes could both observe "no lock" and both succeed, and `releaseLock()`
    unconditionally deleted the file — including a lock another process later
    acquired. Rewritten to:
-   - Acquire with an atomic exclusive create (`writeFile(path, payload, { flag: 'wx' })`
-     = `O_CREAT|O_EXCL`); payload is JSON `{ pid, startedAt, owner }` with a random
-     `owner` token.
-   - On `EEXIST`, reclaim only a **stale** lock (dead pid via `process.kill(pid,0)`,
-     or unparseable content). The reclaim is **serialized behind an atomically-created
-     reclaim sentinel** and finished with an atomic rename-into-place, so concurrent
-     reclaimers cannot each end up believing they hold the lock; a live holder returns
-     "busy".
+   - Acquire with an atomic exclusive create: the payload is written to a private
+     temp file and hard-linked to the lock name (`link` fails with `EEXIST` like
+     `O_CREAT|O_EXCL`), so the lock never exists without its content (#760); a
+     filesystem without hard links falls back to `writeFile(path, payload, { flag: 'wx' })`.
+     Payload is JSON `{ pid, startedAt, owner }` with a random `owner` token.
+   - On `EEXIST`, reclaim only a **stale** lock: one whose owner is provably gone
+     (`process.kill(pid,0)` fails with `ESRCH`). The reclaim is **serialized behind an
+     atomically-created reclaim sentinel** and finished with an atomic rename-into-place,
+     so concurrent reclaimers cannot each end up believing they hold the lock; a live
+     holder returns "busy". Anything that cannot name a dead owner is held (#760): a
+     lock that cannot be read (`EACCES`), an empty or partly written one (the `wx`
+     fallback and older teamai open the file before writing), and a pid owned by another
+     user (`EPERM`). A lock that names no owner, or cannot be read, stays until
+     removed by hand if a crash left it, and a warning names it. A lock that vanished before it could be read gets one more
+     exclusive create instead (a third process may already have re-created it).
+   - Migration skips the locks' transient artifacts (`<lock>.<uuid>.tmp`, `.sentinel`
+     and its temps, `.new-<uuid>`) along with the locks themselves.
    - `releaseLock()` returns early when this process holds no owner token for the
      path, and otherwise deletes only when the on-disk `owner` still matches the token
      this process recorded — never another process's lock.

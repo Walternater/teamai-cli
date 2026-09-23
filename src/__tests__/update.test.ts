@@ -34,6 +34,7 @@ vi.mock('fs-extra', () => ({
     remove: vi.fn(),
     ensureDir: vi.fn(),
     rename: vi.fn(),
+    link: vi.fn(),
   },
 }));
 
@@ -121,6 +122,7 @@ const mockedFse = fse as unknown as {
   remove: Mock;
   ensureDir: Mock;
   rename: Mock;
+  link: Mock;
 };
 const mockedLog = log as unknown as {
   info: Mock;
@@ -157,6 +159,7 @@ beforeEach(() => {
   mockedFse.pathExists.mockResolvedValue(false);
   mockedFse.readFile.mockResolvedValue('');
   mockedFse.writeFile.mockResolvedValue(undefined);
+  mockedFse.link.mockResolvedValue(undefined);
   mockedFse.remove.mockResolvedValue(undefined);
   mockedFse.rename.mockResolvedValue(undefined);
 });
@@ -498,10 +501,10 @@ describe('doUpdate', () => {
 
     await doUpdate();
 
-    expect(mockedFse.writeFile).toHaveBeenCalledWith(
+    // Created by hard-linking a fully written temp file onto the lock name.
+    expect(mockedFse.link).toHaveBeenCalledWith(
       expect.stringContaining('update-lock'),
-      expect.any(String),
-      { flag: 'wx' },
+      expect.stringMatching(/update-lock$/),
     );
     expect(mockedLog.success).toHaveBeenCalled();
     expect(mockedFse.remove).toHaveBeenCalledWith(
@@ -720,14 +723,15 @@ function eexist(): NodeJS.ErrnoException {
 }
 
 describe('acquireLock', () => {
-  it('acquires via an exclusive (wx) create when no lockfile exists', async () => {
-    mockedFse.writeFile.mockResolvedValue(undefined);
+  it('falls back to an exclusive (wx) create when the lock cannot be hard-linked', async () => {
+    mockedFse.link.mockRejectedValue(Object.assign(new Error('EPERM'), { code: 'EPERM' }));
 
     const result = await acquireLock('/tmp/test-lock');
 
     expect(result).toBe(true);
-    const [pathArg, payloadArg, optsArg] = mockedFse.writeFile.mock.calls[0];
-    expect(pathArg).toBe('/tmp/test-lock');
+    const exclusive = mockedFse.writeFile.mock.calls.find(([p]) => p === '/tmp/test-lock');
+    expect(exclusive).toBeDefined();
+    const [, payloadArg, optsArg] = exclusive ?? [];
     expect(optsArg).toEqual({ flag: 'wx' });
     const parsed = JSON.parse(payloadArg as string);
     expect(parsed.pid).toBe(process.pid);
@@ -737,13 +741,11 @@ describe('acquireLock', () => {
 
   it('reclaims a stale lock via an atomic rename-into-place', async () => {
     // The main lock's exclusive create always finds it present (a stale lock);
-    // the sentinel and temp writes succeed. Reclaim completes by renaming the
-    // fresh payload over the stale file. (Concurrency/atomicity is proven for
-    // real in lock-atomic.test.ts.)
-    mockedFse.writeFile.mockImplementation((p: string, _data: string, opts?: { flag?: string }) => {
-      if (p === '/tmp/test-lock' && opts?.flag === 'wx') return Promise.reject(eexist());
-      return Promise.resolve(undefined);
-    });
+    // the sentinel create and temp writes succeed. Reclaim completes by renaming
+    // the fresh payload over the stale file. (Concurrency/atomicity is proven
+    // for real in lock-atomic.test.ts.)
+    mockedFse.link.mockImplementation((_tmp: string, target: string) =>
+      target === '/tmp/test-lock' ? Promise.reject(eexist()) : Promise.resolve(undefined));
     mockedFse.readFile.mockResolvedValue('99999999'); // dead pid → stale
     mockedFse.rename.mockResolvedValue(undefined);
 
@@ -754,7 +756,8 @@ describe('acquireLock', () => {
   });
 
   it('returns false when a live process holds the lock', async () => {
-    mockedFse.writeFile.mockRejectedValue(eexist());
+    mockedFse.link.mockImplementation((_tmp: string, target: string) =>
+      target === '/tmp/test-lock' ? Promise.reject(eexist()) : Promise.resolve(undefined));
     // Our own PID is alive → process.kill(pid, 0) succeeds → not stale.
     mockedFse.readFile.mockResolvedValue(JSON.stringify({ pid: process.pid, owner: 'x' }));
 
@@ -787,7 +790,7 @@ describe('releaseLock', () => {
 
     await releaseLock('/tmp/taken-lock');
 
-    expect(mockedFse.remove).not.toHaveBeenCalled();
+    expect(mockedFse.remove).not.toHaveBeenCalledWith('/tmp/taken-lock');
   });
 
   it('does NOT delete a lock this process never acquired (no owner token)', async () => {
