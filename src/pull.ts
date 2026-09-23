@@ -581,6 +581,11 @@ function logSyncDetail(
  * Tools in `disabledAgents`, and tools outside `enabledAgents` when that
  * whitelist is set, are omitted — the same gate resource handlers use.
  *
+ * Pass `field` to ask about one resource type instead of "any of them": the
+ * generic sync loop needs that to decide whether a "Synced N" claim describes
+ * anything that could land, and a tool whose skills root is absent while its
+ * agents root exists must answer differently for each.
+ *
  * The revision cache is shared by a scope, while tool roots can appear later
  * (for example, when Cursor creates `.cursor/` on its first launch). Persisting
  * this set alongside the revision prevents a pull for one tool from suppressing
@@ -589,13 +594,14 @@ function logSyncDetail(
 async function getInstalledResourceTargets(
   teamConfig: TeamaiConfig,
   localConfig: LocalConfig,
+  field?: 'skills' | 'rules' | 'agents',
 ): Promise<string[]> {
   const targets: string[] = [];
 
   for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     if (isAgentExcluded(localConfig, tool)) continue;
 
-    const resourcePaths = [toolPath.skills, toolPath.rules, toolPath.agents]
+    const resourcePaths = (field ? [toolPath[field]] : [toolPath.skills, toolPath.rules, toolPath.agents])
       .filter((resourcePath): resourcePath is string => !!resourcePath);
     for (const resourcePath of resourcePaths) {
       if (await isToolInstalledForConfig(tool, resourcePath, localConfig)) {
@@ -1198,14 +1204,27 @@ async function pullForScope(
         }
       }
     } else {
+      // Skills and agents land in a tool's own directory, which a brand-new
+      // member may not have yet. The handler skips such a tool by design and
+      // only logs at debug, so counting the team repo's items here would report
+      // a success the disk contradicts (#585). Docs, rules and env are excluded
+      // from this branch entirely — they are written to team-owned locations
+      // that the copy creates. hooks/mcp have no tool-path field to probe, so
+      // they keep reporting unconditionally.
+      const needsToolRoot = type === 'skills' || type === 'agents';
+      const canReceive = !needsToolRoot
+        || (await getInstalledResourceTargets(freshConfig, localConfig, type)).length > 0;
+
       for (const item of items) {
         await handler.pullItem(item, freshConfig, localConfig);
       }
 
-      if (type === 'skills') {
-        logSyncDetail(type, items, existingNames, !!options.verbose, scopeLabel, skippedByTags);
-      } else {
-        log.success(`[${scopeLabel}] Synced ${items.length} ${type}`);
+      if (canReceive) {
+        if (type === 'skills') {
+          logSyncDetail(type, items, existingNames, !!options.verbose, scopeLabel, skippedByTags);
+        } else {
+          log.success(`[${scopeLabel}] Synced ${items.length} ${type}`);
+        }
       }
     }
 
