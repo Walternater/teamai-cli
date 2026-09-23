@@ -20,6 +20,7 @@ import {
   TEAMAI_ENV_END,
   getDataHome,
   getManagedHooksPath,
+  isAgentExcluded,
   managedMcpManifestPath,
   resolveBaseDir,
   resolveHookScope,
@@ -37,6 +38,7 @@ import { ruleStemFromFilename } from './resources/rule-format.js';
 import { agentStemFromFilename } from './resources/agent-format.js';
 import { resolveDocsDestination } from './resources/docs.js';
 import { listTeamAgentDirs } from './resources/agents.js';
+import { isToolInstalledForConfig } from './resources/base.js';
 import { BUILTIN_AGENT_NAMES } from './builtin-agents.js';
 import {
   BUILTIN_SKILL_NAMES,
@@ -87,6 +89,8 @@ interface RemovalPlan {
   opencodeHookScopes: Array<{ baseDir: string; scope: Scope }>;
   /** teamai-managed OMP extension file (~/.omp/agent/extensions/teamai-hooks.ts), if present. */
   ompHookFile: string | null;
+  /** Pi extension files owned by this scope (global for user, legacy project copy for project). */
+  piHookFiles: string[];
   /** TeamAI-managed DeepSeek Harness patch (~/.teamai/dsh/cordis.patch.yml), if present. */
   dshHookFile: string | null;
   /** Manifest used by the primary hook injection scope. */
@@ -132,6 +136,7 @@ interface ToolResources {
   openclawHookDirs: Array<{ hooksDir: string; tool: string }>;
   opencodeHookScopes: Array<{ baseDir: string; scope: Scope }>;
   ompHookFile: string | null;
+  piHookFiles: string[];
   dshHookFile: string | null;
   claudeMdFiles: string[];
   skillDirs: SkillDirEntry[];
@@ -145,6 +150,7 @@ function hasToolResources(r: ToolResources): boolean {
     r.openclawHookDirs.length > 0 ||
     r.opencodeHookScopes.length > 0 ||
     r.ompHookFile !== null ||
+    r.piHookFiles.length > 0 ||
     r.dshHookFile !== null ||
     r.claudeMdFiles.length > 0 ||
     r.skillDirs.length > 0 ||
@@ -273,8 +279,8 @@ async function discoverToolResources(
   hookSettingsPath?: string,
 ): Promise<ToolResources> {
   const res: ToolResources = {
-    hookFiles: [], openclawHookDirs: [], opencodeHookScopes: [], ompHookFile: null, dshHookFile: null, claudeMdFiles: [],
-    skillDirs: [], ruleFiles: [], agentFiles: [],
+    hookFiles: [], openclawHookDirs: [], opencodeHookScopes: [], ompHookFile: null, piHookFiles: [], dshHookFile: null,
+    claudeMdFiles: [], skillDirs: [], ruleFiles: [], agentFiles: [],
   };
 
   // (a) Hooks — settings.json / hooks.json
@@ -318,6 +324,42 @@ async function discoverToolResources(
     const extFile = path.join(resolveOmpExtensionsDir(), OMP_HOOK_FILE);
     if (await pathExists(extFile)) {
       res.ompHookFile = extFile;
+    }
+  } else if (tool === 'pi') {
+    const {
+      hasPiHooks,
+      hasPiAgentHook,
+      resolvePiExtensionsDir,
+      resolvePiProjectExtensionsDir,
+      PI_HOOK_FILE,
+    } = await import('./pi-hooks.js');
+    // Mirrors OMP: a targeted uninstall removes the single global extension
+    // outright, regardless of scope. Pi has no way to scope a shared file to
+    // one project — the generated extension fires for every Pi session
+    // machine-wide — so a scoped "preserve for other projects" guarantee was
+    // never actually enforceable, and pretending otherwise just left Pi still
+    // firing hooks for a project that had supposedly uninstalled it.
+    if (await hasPiHooks()) {
+      res.piHookFiles.push(path.join(resolvePiExtensionsDir(), PI_HOOK_FILE));
+    }
+    // Server-pushed agent hooks (teamai-agent-<slug>.ts) always install into
+    // the global extension dir and can exist without the main lifecycle
+    // extension — mirrors OpenCode's discovery, which scans for the same
+    // leftover-plugin pattern so a Pi-only agent-hook install isn't missed.
+    // Each match is marker-checked by its own slug so a same-named file a
+    // user authored by hand is never swept up.
+    for (const file of await listFiles(resolvePiExtensionsDir())) {
+      const base = path.basename(file);
+      if (!base.startsWith('teamai-agent-') || !base.endsWith('.ts')) continue;
+      const slug = base.slice('teamai-agent-'.length, -'.ts'.length);
+      if (await hasPiAgentHook(slug)) {
+        res.piHookFiles.push(path.join(resolvePiExtensionsDir(), file));
+      }
+    }
+    // Clean up a TeamAI-marked legacy project copy left by an earlier
+    // revision, when this discovery pass is scoped to an actual project.
+    if (path.resolve(baseDir) !== path.resolve(getUserHome()) && await hasPiHooks(baseDir)) {
+      res.piHookFiles.push(path.join(resolvePiProjectExtensionsDir(baseDir), PI_HOOK_FILE));
     }
   } else if (toolPath.settings) {
     // Hooks live where resolveHookScope injected them (HOME for a non-self
@@ -517,6 +559,22 @@ async function buildRemovalPlan(
     );
   }
 
+  // A tool only still "uses" a shared resource (AGENTS.md, .teamai/) if it is
+  // actually enabled and installed. Several tools default to the same shared
+  // path — e.g. Hermes/WorkBuddy default to the same project AGENTS.md as Pi —
+  // so a schema entry that merely shares a path must not block cleanup for a
+  // tool that was never enabled or set up. The probe path must be a
+  // tool-specific root (skills/rules/settings), never `claudemd`: that's
+  // exactly the shared, ambiguous path this check exists to disambiguate.
+  const activeTools = new Set<string>();
+  for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+    if (isAgentExcluded(localConfig, tool)) continue;
+    const probePath = toolPath.skills ?? toolPath.rules ?? toolPath.settings ?? toolPath.claudemd;
+    if (probePath && await isToolInstalledForConfig(tool, probePath, localConfig)) {
+      activeTools.add(tool);
+    }
+  }
+
   // Decide which tools to merge and whether to include shared resources
   let includeShared: boolean;
   let toolsToMerge: string[];
@@ -526,7 +584,7 @@ async function buildRemovalPlan(
     const targetHasResources = targetRes ? hasToolResources(targetRes) : false;
     // Other tools still have teamai resources → keep shared resources.
     const othersHaveResources = [...perTool.entries()]
-      .some(([t, r]) => t !== agentFilter && hasToolResources(r));
+      .some(([t, r]) => t !== agentFilter && activeTools.has(t) && hasToolResources(r));
     // Remove shared resources only when the target itself has resources AND is
     // the last tool using teamai. Targeting a tool with no teamai resources is a
     // no-op for shared resources (plan will be empty → "Nothing to uninstall").
@@ -541,6 +599,7 @@ async function buildRemovalPlan(
     openclawHookDirs: [],
     opencodeHookScopes: [],
     ompHookFile: null,
+    piHookFiles: [],
     dshHookFile: null,
     hookManifestPath: hookTargets[0].manifestPath,
     claudeMdFiles: [],
@@ -557,6 +616,18 @@ async function buildRemovalPlan(
     scope: localConfig.scope,
   };
 
+  // A single instruction file can be the native target for several agents
+  // (for example project `AGENTS.md` is shared by Pi, Hermes, and WorkBuddy).
+  // Keep its TeamAI blocks when another enabled, installed agent still
+  // references the same file; a targeted uninstall must not remove
+  // instructions owned by that remaining agent.
+  const retainedInstructionFiles = new Set<string>();
+  for (const [tool, resources] of perTool) {
+    if (!toolsToMerge.includes(tool) && activeTools.has(tool)) {
+      for (const file of resources.claudeMdFiles) retainedInstructionFiles.add(file);
+    }
+  }
+
   // Merge tool-specific resources for selected tools
   for (const tool of toolsToMerge) {
     const res = perTool.get(tool);
@@ -565,8 +636,13 @@ async function buildRemovalPlan(
     plan.openclawHookDirs.push(...res.openclawHookDirs);
     plan.opencodeHookScopes.push(...res.opencodeHookScopes);
     if (res.ompHookFile) plan.ompHookFile = res.ompHookFile;
+    plan.piHookFiles.push(...res.piHookFiles);
     if (res.dshHookFile) plan.dshHookFile = res.dshHookFile;
-    plan.claudeMdFiles.push(...res.claudeMdFiles);
+    for (const file of res.claudeMdFiles) {
+      if (!retainedInstructionFiles.has(file) && !plan.claudeMdFiles.includes(file)) {
+        plan.claudeMdFiles.push(file);
+      }
+    }
     plan.skillDirs.push(...res.skillDirs);
     plan.ruleFiles.push(...res.ruleFiles);
     plan.agentFiles.push(...res.agentFiles);
@@ -640,6 +716,7 @@ function isPlanEmpty(plan: RemovalPlan): boolean {
     plan.openclawHookDirs.length === 0 &&
     plan.opencodeHookScopes.length === 0 &&
     plan.ompHookFile === null &&
+    plan.piHookFiles.length === 0 &&
     plan.dshHookFile === null &&
     plan.claudeMdFiles.length === 0 &&
     plan.skillDirs.length === 0 &&
@@ -692,6 +769,11 @@ function printSummary(plan: RemovalPlan, agentFilter?: string): void {
   if (plan.ompHookFile !== null) {
     console.log('   OMP Hook (extension):');
     console.log(`     ${plan.ompHookFile}`);
+    console.log('');
+  }
+  if (plan.piHookFiles.length > 0) {
+    console.log(`   Pi Hooks (${plan.piHookFiles.length} files):`);
+    for (const p of plan.piHookFiles) console.log(`     ${p}`);
     console.log('');
   }
 
@@ -782,8 +864,10 @@ async function teardownPlugins(): Promise<void> {
 
 async function executeRemoval(plan: RemovalPlan): Promise<void> {
   // (a) Remove hooks from tool settings (built-in A + team B via the manifest).
-  // Each entry carries the manifest for its own location (HOME/user or a legacy
-  // <projectRoot>/project copy), so team hooks are stripped correctly at both.
+  // Each settings entry carries the manifest for its own location (HOME/user
+  // or a legacy <projectRoot>/project copy), so team hooks are stripped at the
+  // location that owns them. File-based adapters apply their own scope rules
+  // below; in particular, project uninstall never owns Pi's global extension.
   for (const { path: settingsPath, tool, manifestPath } of plan.hookFiles) {
     try {
       await reconcileHooks(settingsPath, tool, [], { removeAll: true, manifestPath });
@@ -826,6 +910,16 @@ async function executeRemoval(plan: RemovalPlan): Promise<void> {
       await removeOmpHooks();
     } catch (e) {
       log.warn(`Failed to remove OMP hook: ${(e as Error).message}`);
+    }
+  }
+
+  // (a2c) Remove the generated Pi extension.
+  for (const hookFile of plan.piHookFiles) {
+    try {
+      await remove(hookFile);
+      log.success(`Removed Pi hook from ${hookFile}`);
+    } catch (e) {
+      log.warn(`Failed to remove Pi hook ${hookFile}: ${(e as Error).message}`);
     }
   }
 
