@@ -17,6 +17,7 @@ import { deriveSessionId } from './utils/session-id.js';
 import { log } from './utils/logger.js';
 import { normalizeToolName } from './utils/tool-names.js';
 import { resolveHookCwd } from './utils/hook-cwd.js';
+import { pathExists } from './utils/fs.js';
 
 // ─── Public types ───────────────────────────────────────
 
@@ -109,8 +110,16 @@ export const PULL_TIMEOUT_MS = 120_000;
 
 const pullHandler: HookHandler = {
   name: 'pull',
-  async execute(stdin, tool) {
+  async execute(stdin, tool, config) {
     const cwd = resolveHookCwd(stdin);
+    // No config resolved: teamai is not set up here, or the project config
+    // cannot be read. Only the second stops the pull, since what detection
+    // loads after that file may be another team's (#784). A cwd that no longer
+    // exists holds no project config, and git refuses to open it.
+    if (!config && (cwd === undefined || await pathExists(cwd))) {
+      const { findUnreadableProjectConfig } = await import('./config.js');
+      if (await findUnreadableProjectConfig(cwd) !== null) return null;
+    }
     const hintCwd = cwd ?? process.cwd();
     const packageHints = await import('./pkg/pkg-hint.js');
     const packageHashBeforePull = await packageHints.packageManifestHashForCwd(hintCwd);
