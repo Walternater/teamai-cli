@@ -37,6 +37,7 @@ Generated: do not edit by hand. Regenerate with
   - `--skill <path>` — Push a specific skill by path (e.g., ~/.claude/skills/hai/my-skill or skills/hai_dev/my-skill)
   - `--role <id>` — Namespace for new skills, rules and agents (skills/<id>/, rules/<id>/, agents/<id>/)
   - `--project <id>` — Target a project: each new resource goes to that project's namespace for its own type — skills, knowledge for rules, agents (from manifest/projects.yaml)
+  - `--branch <name>` — Push to this destination branch instead of a generated teamai/push branch
 
 ## pull
 

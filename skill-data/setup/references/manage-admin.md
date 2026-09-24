@@ -16,7 +16,12 @@ existing ones:
 teamai push            # review the diff, then confirm
 teamai push --all      # push everything without per-item confirmation
 teamai push --skill <path>   # push one specific skill
+teamai push --branch <name> # use an explicit branch for a new push
 ```
+
+An existing open PR is updated on its recorded branch. TeamAI refuses to reset a
+team-repo clone with unrelated modified, staged, untracked, or conflicted files;
+commit or stash those changes before retrying.
 
 Members receive it automatically the next time they open a session (or when they
 run `teamai pull`).
