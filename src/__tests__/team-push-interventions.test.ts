@@ -91,7 +91,7 @@ describe('reportUsageToTeam — intervention reporting', () => {
         interventions: { interrupt: 1, toolReject: 0 },
         tokens: { input: 10, output: 5, cacheRead: 0, cacheCreation: 0 } },
     ]);
-    const usagePath = path.join(tmpDir, '.teamai', 'usage.jsonl');
+    const usagePath = path.join(tmpDir, '.teamai', 'user-usage.jsonl');
     fs.writeFileSync(usagePath, JSON.stringify({ skill: 'review', timestamp, tool: 'claude' }) + '\n');
     return usagePath;
   }

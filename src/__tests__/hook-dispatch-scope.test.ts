@@ -77,7 +77,7 @@ describe('hook runs and the scope they belong to (#748)', () => {
     await hook('stop', '*', { ...base, hook_event_name: 'Stop' });
 
     expect(fs.existsSync(path.join(teamaiHome(), 'dashboard', 'events.jsonl'))).toBe(false);
-    expect(fs.existsSync(path.join(teamaiHome(), 'usage.jsonl'))).toBe(false);
+    expect(fs.existsSync(path.join(teamaiHome(), 'user-usage.jsonl'))).toBe(false);
     expect(fs.existsSync(path.join(teamaiHome(), 'sessions', 'sid-b.json'))).toBe(false);
   });
 
@@ -102,7 +102,7 @@ describe('hook runs and the scope they belong to (#748)', () => {
 
     await hook('post-tool-use', 'Skill', { session_id: 'sid-g', cwd: gone, hook_event_name: 'PostToolUse', tool_name: 'Skill', tool_input: { skill: 'skill-g' } });
 
-    expect(fs.readFileSync(path.join(teamaiHome(), 'usage.jsonl'), 'utf-8')).toContain('skill-g');
+    expect(fs.readFileSync(path.join(teamaiHome(), 'user-usage.jsonl'), 'utf-8')).toContain('skill-g');
   });
 
   it('handlers follow the scope the dispatcher resolved, not the directory the hook process runs in (#752)', async () => {
@@ -163,6 +163,22 @@ describe('hook runs and the scope they belong to (#748)', () => {
 
     await hook('post-tool-use', 'Skill', { session_id: 'sid-a', cwd: root, hook_event_name: 'PostToolUse', tool_name: 'Skill', tool_input: { skill: 'skill-a' } });
 
-    expect(fs.existsSync(path.join(teamaiHome(), 'usage.jsonl'))).toBe(false);
+    expect(fs.existsSync(path.join(teamaiHome(), 'user-usage.jsonl'))).toBe(false);
+  });
+
+  it('an unreadable partition config does not hand the project to its legacy .teamai config', async () => {
+    const root = gitRepo('project-a');
+    const partition = await resolveProjectDataHome(root);
+    fs.mkdirSync(partition, { recursive: true });
+    fs.writeFileSync(path.join(partition, 'config.yaml'), 'repo: [not: a, valid config\n');
+    // A lower-priority legacy config that names another team.
+    const legacy = path.join(root, '.teamai');
+    fs.mkdirSync(legacy);
+    fs.writeFileSync(path.join(legacy, 'config.yaml'),
+      `repo:\n  localPath: ${path.join(legacy, 'team-repo')}\n  remote: https://example.test/acme/other-team.git\nusername: tester\nscope: project\n`);
+
+    await hook('post-tool-use', 'Skill', { session_id: 'sid-a', cwd: root, hook_event_name: 'PostToolUse', tool_name: 'Skill', tool_input: { skill: 'skill-a' } });
+
+    expect(fs.existsSync(path.join(legacy, 'usage.jsonl'))).toBe(false);
   });
 });

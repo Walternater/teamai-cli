@@ -69,7 +69,7 @@ Transform TeamAI from a simple skill-sharing CLI into a **Team Intelligence Plat
 **Storage:** `~/.teamai/sessions/<year-month>.md` 按月聚合。
 
 #### 2. Skill Usage Tracker (Local)
-**What:** PostToolUse hook 检测 Claude Code 的 Skill 工具调用，追加写入该 scope 的 `<dataHome>/usage.jsonl`（会话所在目录对应的已配置项目，否则 user scope 的 `~/.teamai/`；未配置 teamai 的目录不记录，#748）。
+**What:** PostToolUse hook 检测 Claude Code 的 Skill 工具调用，追加写入该 scope 的 `<dataHome>/usage.jsonl`（会话所在目录对应的已配置项目，否则 user scope 的 `~/.teamai/user-usage.jsonl`；未配置 teamai 的目录不记录，#748）。
 
 **Data format (JSONL, one event per line):**
 ```jsonl
@@ -95,7 +95,7 @@ Skill Usage Statistics:
 teamai pull
     │
     ▼
-聚合 <dataHome>/usage.jsonl → stats/<user>.yaml
+聚合该 scope 的 usage 文件 → stats/<user>.yaml
     │
     ▼
 reports worktree → git add → git commit → git push (teamai-reports)
@@ -162,12 +162,14 @@ reports worktree → git add → git commit → git push (teamai-reports)
                      │ recommend.ts   │            │
 ┌──────────────┐     │ digest.ts      │     push --stats
 │ Local        │     │ stats.ts       │     push --sessions
-│ <dataHome>/  │◀───│ team-push.ts ──┼────▶(直接 commit, 无 MR)
-│  usage.jsonl │     │                │
+│ ~/.teamai/   │◀───│ team-push.ts ──┼────▶(直接 commit, 无 MR)
+│  usage*      │     │                │
 │  sessions/   │     └────────────────┘
 │   <Y-M>.md   │
 └──────────────┘
 ```
+
+\* skill 使用记录按 scope 存放：项目为 `<dataHome>/usage.jsonl`（项目分区），user scope 为 `~/.teamai/user-usage.jsonl`（#748）；`sessions/` 仍是机器级别的 `~/.teamai/`。
 
 ## New Files
 

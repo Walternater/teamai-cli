@@ -5,6 +5,7 @@ import { normalizeToolName } from './utils/tool-names.js';
 import {
   getCopilotHome,
   getDataHome,
+  getTeamaiHomeDir,
   SKILL_NAME_REGEX,
   type LocalConfig,
   type UsageEvent,
@@ -21,9 +22,17 @@ import { resolveConfigForDir, resolveMemberToolRoots } from './config.js';
  * The usage JSONL of one scope: `<dataHome>/usage.jsonl`, so each scope reports
  * only the skills used where it is set up (#748). Evaluated at call time to
  * respect HOME changes in tests.
+ *
+ * The user scope records in `~/.teamai/user-usage.jsonl` instead: every scope
+ * used to record in `~/.teamai/usage.jsonl`, and an earlier release still does
+ * after a rollback, so what that file holds names no project. It is never
+ * read, so the user scope cannot report it to its team.
  */
 function getUsagePath(config: LocalConfig): string {
-  return path.join(getDataHome(config), 'usage.jsonl');
+  const dataHome = getDataHome(config);
+  const sharedDir = getTeamaiHomeDir();
+  if (path.resolve(dataHome) !== path.resolve(sharedDir)) return path.join(dataHome, 'usage.jsonl');
+  return path.join(sharedDir, 'user-usage.jsonl');
 }
 
 /** Get the known-skills.json path (evaluated at call time to respect HOME changes in tests). */
@@ -53,7 +62,7 @@ function getKnownSkillsPath(): string {
 //               [resolveConfigForDir(cwd)] ─null─▶ skip (#748)
 //                       │
 //                       ▼
-//               appendFile(<dataHome>/usage.jsonl, JSON line)
+//               appendFile(<scope usage file>, JSON line)
 //                       │
 //                       ▼
 //               updateKnownSkills(skill) → known-skills.json
@@ -75,7 +84,7 @@ function getKnownSkillsPath(): string {
 //  [extract & validate skill name after "/"]
 //      │
 //      ▼
-//  appendFile(<dataHome>/usage.jsonl) + updateKnownSkills()
+//  appendFile(<scope usage file>) + updateKnownSkills()
 //
 
 /**
@@ -231,19 +240,6 @@ export async function appendUsageEvent(event: UsageEvent, config: LocalConfig): 
   } catch (e) {
     log.error(`Failed to write usage event: ${(e as Error).message}`);
   }
-}
-
-/**
- * Drop the user-scope usage file when a machine first gets a user scope. What
- * it holds was recorded while every scope shared that file, so nothing says
- * which project each event came from; the new user scope must not report it
- * to its team (#748).
- */
-export async function discardUnattributedUsage(userConfig: LocalConfig): Promise<void> {
-  const usagePath = getUsagePath(userConfig);
-  if (!(await pathExists(usagePath))) return;
-  await fs.promises.rm(usagePath, { force: true });
-  log.debug(`Discarded ${usagePath}: its events predate this user scope and name no project (#748)`);
 }
 
 /**
