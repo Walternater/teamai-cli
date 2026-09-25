@@ -130,28 +130,30 @@ scope: 'user',
       expect(allOutput).not.toContain('https://api.example.com');
     });
 
-    it('prints the roles and projects restriction of a variable, and nothing for an unscoped one', async () => {
-      await fse.writeFile(
-        path.join(repoPath, 'env', 'env.yaml'),
-        YAML.stringify({
-          variables: [
-            { key: 'CHECKOUT_URL', value: 'c', projects: ['checkout'] },
-            { key: 'BOTH', value: 'b', roles: ['frontend'], projects: ['checkout', 'billing'] },
-            { key: 'NOBODY', value: 'n', projects: [] },
-            { key: 'SHARED', value: 's' },
-          ],
-        }),
-      );
+    it('lists root and active namespace variables, each with where it comes from (#707)', async () => {
+      await fse.outputFile(path.join(repoPath, 'manifest', 'projects.yaml'), YAML.stringify({
+        version: 1,
+        projects: [{ id: 'checkout', resources: { env: ['checkout'] } }, { id: 'billing', resources: { env: ['billing'] } }],
+      }));
+      await fse.writeFile(path.join(repoPath, 'env', 'env.yaml'), YAML.stringify({
+        variables: [{ key: 'API_BASE', value: 'root-value' }, { key: 'SHARED', value: 's' }],
+      }));
+      await fse.outputFile(path.join(repoPath, 'env', 'checkout', 'env.yaml'), YAML.stringify({
+        variables: [{ key: 'API_BASE', value: 'checkout-value' }, { key: 'CHECKOUT_ONLY', value: 'c' }],
+      }));
+      await fse.outputFile(path.join(repoPath, 'env', 'billing', 'env.yaml'), YAML.stringify({
+        variables: [{ key: 'BILLING_ONLY', value: 'b' }],
+      }));
+      const { detectProjectConfig } = await import('../config.js');
+      vi.mocked(detectProjectConfig).mockResolvedValueOnce({ ...localConfig, projects: ['checkout'] });
 
-      await envList({});
+      await envList({ reveal: true });
 
       const allOutput = consoleSpy.mock.calls.map(c => c[0]).join('\n');
-      expect(allOutput).toContain('(projects: checkout)');
-      expect(allOutput).toContain('(roles: frontend)  (projects: checkout, billing)');
-      expect(allOutput).toContain('(projects: nobody)');
-      expect(allOutput).toMatch(/SHARED=\S+$/m);
-      expect(allOutput.match(/projects:/g)).toHaveLength(3);
-      expect(allOutput.match(/roles:/g)).toHaveLength(1);
+      expect(allOutput).toContain('API_BASE=checkout-value  (checkout, overrides root)');
+      expect(allOutput).toContain('SHARED=s  (root)');
+      expect(allOutput).toContain('CHECKOUT_ONLY=c  (checkout)');
+      expect(allOutput).not.toContain('BILLING_ONLY');
     });
 
     it('should reveal plaintext values when reveal=true', async () => {
@@ -307,6 +309,143 @@ scope: 'user',
   });
 
   // ─── envRemove ───────────────────────────────────────────
+
+  describe('--role / --project (#707)', () => {
+    async function writeProjects(): Promise<void> {
+      await fse.outputFile(path.join(repoPath, 'manifest', 'projects.yaml'), YAML.stringify({
+        version: 1,
+        projects: [
+          { id: 'checkout', resources: { env: ['checkout-env'] } },
+          { id: 'billing', resources: { skills: ['billing'] } },
+        ],
+      }));
+    }
+    const nsFile = (ns: string) => path.join(repoPath, 'env', ns, 'env.yaml');
+
+    it('env add --role writes env/<ns>/env.yaml and leaves the root file alone', async () => {
+      await fse.writeFile(path.join(repoPath, 'env', 'env.yaml'), YAML.stringify({ variables: [{ key: 'API_BASE', value: 'root' }] }));
+
+      await envAdd('API_BASE', 'checkout', { role: 'checkout' });
+
+      expect(YAML.parse(await fse.readFile(nsFile('checkout'), 'utf-8')).variables).toEqual([{ key: 'API_BASE', value: 'checkout' }]);
+      expect(YAML.parse(await fse.readFile(path.join(repoPath, 'env', 'env.yaml'), 'utf-8')).variables)
+        .toEqual([{ key: 'API_BASE', value: 'root' }]);
+      expect(log.success).toHaveBeenCalledWith('Added env variable in env/checkout/env.yaml: API_BASE=checkout');
+    });
+
+    // A namespace file nobody declares reaches nobody, and doctor cannot tell.
+    it('env add --role warns when no role or project declares the namespace, and still writes', async () => {
+      await writeProjects();
+
+      await envAdd('API_BASE', 'x', { role: 'checkout' });
+
+      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(
+        'No role or project declares env namespace "checkout", so env/checkout/env.yaml reaches nobody',
+      ));
+      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('manifest/roles.yaml'));
+      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('manifest/projects.yaml'));
+      expect(await fse.pathExists(nsFile('checkout'))).toBe(true);
+    });
+
+    it('env add --role says nothing more when a project declares the namespace', async () => {
+      await writeProjects();
+      vi.mocked(log.warn).mockClear();
+
+      await envAdd('API_BASE', 'x', { role: 'checkout-env' });
+
+      expect(log.warn).not.toHaveBeenCalled();
+    });
+
+    it("env add --project writes the project's declared env namespace", async () => {
+      await writeProjects();
+
+      await envAdd('API_BASE', 'x', { project: 'checkout' });
+
+      expect(YAML.parse(await fse.readFile(nsFile('checkout-env'), 'utf-8')).variables).toEqual([{ key: 'API_BASE', value: 'x' }]);
+    });
+
+    // Pull reads a declared namespace from its directory case-folded. A write
+    // into a new exact-case directory would shadow that one on a
+    // case-sensitive filesystem, and its variables would stop being delivered.
+    it('env add --project writes into the existing directory whose name differs only in case', async () => {
+      await writeProjects();
+      await fse.outputFile(nsFile('Checkout-Env'), YAML.stringify({ variables: [{ key: 'DB_URL', value: 'db' }] }));
+
+      await envAdd('API_BASE', 'x', { project: 'checkout' });
+
+      expect(log.success).toHaveBeenCalledWith('Added env variable in env/Checkout-Env/env.yaml: API_BASE=x');
+      expect(YAML.parse(await fse.readFile(nsFile('Checkout-Env'), 'utf-8')).variables)
+        .toEqual([{ key: 'DB_URL', value: 'db' }, { key: 'API_BASE', value: 'x' }]);
+    });
+
+    // --project resolves through manifest/projects.yaml: a stale copy may name
+    // a namespace the project no longer uses, and push would publish that file.
+    it('env add --project changes nothing when the team repo cannot be refreshed', async () => {
+      await writeProjects();
+      vi.mocked(pullRepo).mockRejectedValueOnce(new Error('network down'));
+
+      await envAdd('API_BASE', 'x', { project: 'checkout' });
+
+      expect(log.error).toHaveBeenCalledWith(expect.stringContaining('network down'));
+      expect(log.error).toHaveBeenCalledWith(expect.stringContaining('Nothing was changed'));
+      expect(await fse.pathExists(nsFile('checkout-env'))).toBe(false);
+      expect(process.exitCode).toBe(1);
+      process.exitCode = 0;
+    });
+
+    // Writing the parsed result back would replace every variable the file had.
+    it('env add refuses to write into a namespace file that does not parse, and leaves it as it was', async () => {
+      const broken = 'API_BASE: root\nDB_URL: db\n';
+      await fse.outputFile(nsFile('checkout'), broken);
+
+      await envAdd('NEW_KEY', 'x', { role: 'checkout' });
+
+      expect(log.error).toHaveBeenCalledWith(expect.stringContaining('env/checkout/env.yaml'));
+      expect(await fse.readFile(nsFile('checkout'), 'utf-8')).toBe(broken);
+      expect(process.exitCode).toBe(1);
+      process.exitCode = 0;
+    });
+
+    it('env remove refuses to write into a namespace file that does not parse, and leaves it as it was', async () => {
+      const broken = 'variables:\n  - key: API_BASE\n    value: [\n';
+      await fse.outputFile(nsFile('checkout'), broken);
+
+      await envRemove('API_BASE', { role: 'checkout' });
+
+      expect(log.error).toHaveBeenCalledWith(expect.stringContaining('env/checkout/env.yaml'));
+      expect(await fse.readFile(nsFile('checkout'), 'utf-8')).toBe(broken);
+      expect(process.exitCode).toBe(1);
+      process.exitCode = 0;
+    });
+
+    it('env add --project refuses a project that declares no env namespace, and writes nothing', async () => {
+      await writeProjects();
+
+      await envAdd('API_BASE', 'x', { project: 'billing' });
+
+      expect(log.error).toHaveBeenCalledWith(expect.stringContaining('Project "billing" declares no env namespace'));
+      expect(await fse.pathExists(path.join(repoPath, 'env', 'billing'))).toBe(false);
+      process.exitCode = 0;
+    });
+
+    it('env add refuses --role together with --project', async () => {
+      await envAdd('API_BASE', 'x', { role: 'a', project: 'checkout' });
+      expect(log.error).toHaveBeenCalledWith('Use either --role or --project, not both.');
+      process.exitCode = 0;
+    });
+
+    it('env remove --role removes from the namespace file only', async () => {
+      await fse.writeFile(path.join(repoPath, 'env', 'env.yaml'), YAML.stringify({ variables: [{ key: 'API_BASE', value: 'root' }] }));
+      await fse.outputFile(nsFile('checkout'), YAML.stringify({ variables: [{ key: 'API_BASE', value: 'checkout' }] }));
+
+      await envRemove('API_BASE', { role: 'checkout' });
+
+      expect(YAML.parse(await fse.readFile(nsFile('checkout'), 'utf-8')).variables).toEqual([]);
+      expect(YAML.parse(await fse.readFile(path.join(repoPath, 'env', 'env.yaml'), 'utf-8')).variables)
+        .toEqual([{ key: 'API_BASE', value: 'root' }]);
+      expect(log.success).toHaveBeenCalledWith('Removed env variable in env/checkout/env.yaml: API_BASE');
+    });
+  });
 
   describe('envRemove', () => {
     it('should remove existing variable locally and show push hint', async () => {

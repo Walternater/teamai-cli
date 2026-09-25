@@ -92,14 +92,38 @@ above, each of which opens a PR (`--dry-run` previews). After `projects remove`,
 keep the project's content in the team repo until members have pulled: that is
 what lets their next pull clean up the copies they deployed.
 
-Every namespace that names a directory — `knowledge`, `skills` and `agents` in
-either manifest, and `learnings` in `projects.yaml` (a role's `learnings:` is
+Every namespace that names a directory — `knowledge`, `skills`, `agents`, `env`,
+`hooks`, `mcp`, `models` and `docs` in either manifest, and `learnings` in `projects.yaml` (a role's `learnings:` is
 ignored and unchecked) — must be a single path segment: no `/`, `\`, `:` or control character, no trailing
-`.` or space, and not a Windows device name (`CON`, `NUL`, `COM1`, …). Two
+`.` or space, and not a Windows device name (`CON`, `NUL`, `COM1`, …). `team-codebase`
+cannot be a `docs` namespace (`docs/team-codebase/` is the legacy codebase output). Two
 namespaces of one resource type may not differ only by case, across both
 manifests. A manifest that breaks this, does not parse, or is empty stops
 members' pull for that scope until it is fixed; the error names the entry. Fix
 it rather than deleting it — with no `roles.yaml`, delivery is unfiltered.
+
+An item in an active namespace replaces the root item of the same name, whole:
+a skill by directory name (including a root skill a member gets through a tag),
+an agent by file stem, a rule by first-level file name (`rules/<ns>/<name>.md`
+replaces `rules/<name>.md`), and a `claudemd/<ns>/<name>.md` file replaces
+`claudemd/<name>.md`. Use this to give a project its own version of a shared
+item under the same name, and keep that shared item at the root rather than in
+a namespace every role activates: `rules/code-style.md` is replaced by
+`rules/checkout/code-style.md` for checkout members, while a
+`rules/common/code-style.md` would reach them alongside it. The same skill or
+agent name in two namespaces one member has active is an error naming both
+files; two namespace rules or claudemd files of one name are both delivered.
+A replacement must be usable to replace anything: a skill directory needs its
+`SKILL.md` (pull names one without it), and while an agent file does not parse
+the root agent stays installed. `teamai doctor` lists each replacement as a note. Teams without roles or
+projects are unaffected.
+
+Docs have no override. A top-level `docs/<ns>/` that any role or project lists
+under `resources.docs` reaches only members with that namespace active; a
+`docs/<dir>/` nobody lists stays shared with everyone. When a member leaves the
+namespace, their next pull removes its docs that still match the team copy and
+keeps (and names) the ones they edited. Recall and `teamai doctor` follow the
+same filter.
 
 ## Team dashboard (web UI)
 
@@ -122,14 +146,39 @@ teamai packages install code-review@claude-plugins-official   # Claude plugin
 teamai push                                 # share the updated teamai.yaml
 ```
 
-## Shared environment variables
+## Shared environment variables, hooks and MCP servers
 
 ```bash
-teamai env list              # list (values masked)
+teamai env list              # what reaches this directory, each with its namespace (values masked)
 teamai env list --reveal     # show values in plaintext
-teamai env add <KEY> <VALUE> # add or update
-teamai env remove <KEY>      # remove
+teamai env add <KEY> <VALUE> # add or update in env/env.yaml
+teamai env add <KEY> <VALUE> --project <id>   # or --role <ns>: in that namespace's env/<ns>/env.yaml (warns if nothing declares <ns>)
+teamai env remove <KEY>      # remove (same --role / --project)
+teamai remove mcp <name>     # root mcp/mcp.yaml if it has the name, else the one namespace file; --role / --project pick a namespace
 ```
+
+Env variables, team hooks and MCP servers are scoped like skills: the root file
+(`env/env.yaml`, `hooks/hooks.yaml`, `mcp/mcp.yaml`) reaches everyone, and
+`env/<ns>/env.yaml`, `hooks/<ns>/hooks.yaml`, `mcp/<ns>/mcp.yaml` reach only
+members whose role or project lists `<ns>` under `resources.env`, `resources.hooks`
+or `resources.mcp`. A namespace entry replaces the root entry of the same key, hook
+id or server name. Hooks and MCP servers have no add command, and `teamai push`
+does not pick up `hooks/` or `mcp/`: edit the file in the team repo, then commit
+and push it with git. `teamai doctor` lists each override.
+
+- A name twice in one file, in two active namespaces, or an active file that does
+  not parse: that type is not applied for affected members and their installed
+  state is kept. Fix the file the warning names.
+- Per-entry `projects:` (and `roles:` on env) no longer works: such an entry reaches
+  nobody. `roles:` on hooks and MCP still filters for one more minor release. Pull
+  and `teamai doctor` name the namespace file each entry belongs in; move it there.
+- Team model profiles work the same way: `models/<ns>/models.yaml`, declared under
+  `resources.models`, replaces the root profile with the same `id` for members who
+  have `<ns>` active. A member's API key is bound to the profile's gateway origin:
+  when an override points at another host, their pull leaves the agent alone and
+  asks them to run `teamai models switch team:<id>` to set the key for it.
+- Have every member upgrade before declaring `env`, `hooks`, `mcp`, `models` or `docs` in a
+  manifest: teamai 0.25.0 and the 0.26.0 betas reject those keys and their pull stops.
 
 ## When sync fails
 

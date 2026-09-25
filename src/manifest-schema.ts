@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { expandHome } from './utils/fs.js';
 import { z } from 'zod';
+import { warnOnce } from './utils/warn-once.js';
 
 /**
  * What `manifest/projects.yaml` and `manifest/roles.yaml` share: the spelling of
@@ -60,6 +61,67 @@ export const NAMESPACE_RULE = "resource namespace must be a single path segment 
 export const NamespaceSegmentSchema = z.string().min(1).refine(isSafeNamespaceSegment, (value) => ({
   message: `${NAMESPACE_RULE}; got ${JSON.stringify(value)}`,
 }));
+
+/**
+ * The `resources:` types an admin declares by hand (#707): `roles add` and
+ * `projects add/update --namespaces` never write them. A 0.25.0 or 0.26.0-beta
+ * CLI rejects a `resources:` key it does not know, so a manifest that carries
+ * one breaks pull for every member still on those versions. They are therefore
+ * optional in both manifest schemas rather than defaulted: a manifest this CLI
+ * writes back carries one only when an admin declared it. A new type is one
+ * entry here plus one line in the shape below.
+ */
+export const HAND_DECLARED_RESOURCE_TYPES = ['env', 'hooks', 'mcp', 'models', 'docs'] as const;
+
+export type HandDeclaredResourceType = typeof HAND_DECLARED_RESOURCE_TYPES[number];
+
+const OptionalNamespaceList = z.array(NamespaceSegmentSchema).optional();
+
+/**
+ * `docs/team-codebase/` is the legacy codebase output, which recall and the
+ * wiki still read as such, so it cannot also be a docs namespace. Compared
+ * case-folded: on a case-insensitive filesystem `Team-Codebase` is that
+ * directory too.
+ */
+export const RESERVED_DOCS_DIR = 'team-codebase';
+
+const DocsNamespaceList = z.array(NamespaceSegmentSchema.refine(
+  (value) => caseFoldKey(value) !== RESERVED_DOCS_DIR,
+  (value) => ({
+    message: `"${value}" cannot be a docs namespace: docs/${RESERVED_DOCS_DIR}/ is reserved for the legacy codebase output. Pick another name and move its directory`,
+  }),
+)).optional();
+
+/** Spread into the roles and projects `resources:` schemas. */
+export const HandDeclaredNamespacesShape = {
+  env: OptionalNamespaceList,
+  hooks: OptionalNamespaceList,
+  mcp: OptionalNamespaceList,
+  models: OptionalNamespaceList,
+  docs: DocsNamespaceList,
+} satisfies Record<HandDeclaredResourceType, z.ZodOptional<z.ZodArray<z.ZodType<string>>>>;
+
+/**
+ * Warn about `resources:` keys this CLI does not know, instead of failing the
+ * manifest (#707). Refusing them is what made each new axis break pull for
+ * members on an older CLI; from this version on, an unknown key only means the
+ * team declared a type this CLI cannot deliver yet. Once per run: manifests
+ * load several times per pull. Never throws.
+ */
+export function warnUnknownResourceKeys(
+  resources: object,
+  allowed: ReadonlySet<string>,
+  kind: 'projects' | 'roles',
+  owner: string,
+): void {
+  for (const key of Object.keys(resources)) {
+    if (allowed.has(key)) continue;
+    warnOnce(
+      `manifest/${kind}.yaml: ${owner} declares unknown resource type "${key}", which this CLI ignores. `
+      + `Known types: ${[...allowed].join(', ')}. Upgrade teamai if the team uses a newer type, or remove the key.`,
+    );
+  }
+}
 
 /**
  * A role id that stands in for a namespace when `roles.yaml` is absent. The
@@ -170,7 +232,7 @@ export interface NamespaceEntry {
  * toward joining (`ß`/`ss` and `ı`/`i` count as one name), which can only
  * reject a pair, never let an alias through.
  */
-function caseFoldKey(name: string): string {
+export function caseFoldKey(name: string): string {
   return Array.from(name.normalize('NFC'), (ch) => ch.toUpperCase().toLowerCase()).join('').normalize('NFC');
 }
 

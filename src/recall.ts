@@ -324,7 +324,6 @@ async function loadOrBuildScopeIndex(
     const votesExist = await pathExists(votesDir);
     const docsDir = path.join(localConfig.repo.localPath, 'docs');
     const rulesDir = path.join(localConfig.repo.localPath, 'rules');
-    const skillsDir = path.join(localConfig.repo.localPath, 'skills');
     const repoCodebaseDir = path.join(localConfig.repo.localPath, 'docs', 'team-codebase');
     const hasLegacyCodebase = await pathExists(repoCodebaseDir);
     if (hasLegacyCodebase) {
@@ -339,12 +338,14 @@ async function loadOrBuildScopeIndex(
     );
 
     try {
+      const { deliveredIndexSources } = await import('./resources/desired.js');
       await buildIndex({
         learningsDirs: indexLearningsDirs,
         learningsNamespaces,
         docsDir: await pathExists(docsDir) ? docsDir : undefined,
         rulesDir: await pathExists(rulesDir) ? rulesDir : undefined,
-        skillsDir: await pathExists(skillsDir) ? skillsDir : undefined,
+        // The docs and skills pull delivers here, not the whole trees (#707).
+        ...await deliveredIndexSources(localConfig),
         codebaseDir: undefined, // codebase now served by teamwiki/ graph engine
         votesDir: votesExist ? votesDir : undefined,
         indexPath,

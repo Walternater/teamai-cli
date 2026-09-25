@@ -1,9 +1,13 @@
 import path from 'node:path';
+import fs from 'node:fs/promises';
 import fse from 'fs-extra';
 import { ResourceHandler } from './base.js';
 import { resolveBaseDir, type ResourceItem, type TeamaiConfig, type LocalConfig } from '../types.js';
-import { expandHome } from '../utils/fs.js';
+import { expandHome, listDirs, pruneEmptyDirs } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
+import { caseFoldKey } from '../manifest-schema.js';
+import { resolveResourceNamespaces } from '../resource-namespaces.js';
+import { isPastVersionOf } from '../utils/git.js';
 
 /**
  * The single directory the team docs bundle is copied into. In project scope a
@@ -94,12 +98,19 @@ async function hasHiddenEntries(dir: string): Promise<boolean> {
   return false;
 }
 
-/** Find replacements without traversing destination links or touching either tree. */
-async function findDocConflicts(source: string, destination: string): Promise<Array<{ source: string; target: string }>> {
+/**
+ * Find replacements without traversing destination links or touching either
+ * tree. `withheld` names top-level directories that are not copied (#707).
+ */
+async function findDocConflicts(
+  source: string,
+  destination: string,
+  withheld: ReadonlySet<string> = new Set(),
+): Promise<Array<{ source: string; target: string }>> {
   const conflicts: Array<{ source: string; target: string }> = [];
   const localEntries = new Map((await readEntries(destination)).map(entry => [entry.name, entry]));
   for (const entry of await readEntries(source)) {
-    if (entry.name.startsWith('.')) continue;
+    if (entry.name.startsWith('.') || withheld.has(entry.name)) continue;
     const local = localEntries.get(entry.name);
     if (!local) continue;
     const src = path.join(source, entry.name);
@@ -116,11 +127,13 @@ async function findDocConflicts(source: string, destination: string): Promise<Ar
   return conflicts;
 }
 
-async function copyDocs(source: string, destination: string): Promise<void> {
-  const conflicts = await findDocConflicts(source, destination);
+/** Copy `source` over `destination`, except the top-level directories in `withheld`. */
+async function copyDocs(source: string, destination: string, withheld: ReadonlySet<string>): Promise<void> {
+  const conflicts = await findDocConflicts(source, destination, withheld);
   const staging = conflicts.length ? await fse.mkdtemp(path.join(destination, '.teamai-docs-')) : undefined;
   const moved: Array<{ target: string; backup: string }> = [];
   const visible = (src: string) => !path.basename(src).startsWith('.');
+  const delivered = (src: string) => visible(src) && !withheld.has(path.relative(source, src).split(path.sep)[0] ?? '');
   try {
     // Prepare replacements while the old entries are still in place. A copy
     // failure must not remove the directory/file it was meant to replace.
@@ -130,7 +143,7 @@ async function copyDocs(source: string, destination: string): Promise<void> {
     const replacedSources = new Set(conflicts.map(conflict => conflict.source));
     await fse.copy(source, destination, {
       overwrite: true,
-      filter: src => visible(src) && !replacedSources.has(src),
+      filter: src => delivered(src) && !replacedSources.has(src),
     });
     // Copying has finished before any rename: no copy worker can write into
     // a conflicting path while it is being replaced or restored.
@@ -150,6 +163,94 @@ async function copyDocs(source: string, destination: string): Promise<void> {
     throw error;
   }
   if (staging) await fse.remove(staging);
+}
+
+/** What pull delivers from the team repo's `docs/`, and what it withholds (#707). */
+export interface DesiredDocs {
+  /** The team repo's `docs/`. */
+  readonly sourceDir: string;
+  /** The files delivered, relative to `sourceDir` as `listDocFiles` lists them, minus an inactive namespace's. */
+  readonly files: readonly string[];
+  /** Each `docs/<dir>/` of a namespace declared but not active here, with its files. */
+  readonly withheld: ReadonlyArray<{ readonly dir: string; readonly files: readonly string[] }>;
+}
+
+/**
+ * The docs this member receives: every file under `docs/` except those under a
+ * top-level directory named by `inactiveNamespaces`. A directory no role or
+ * project declares is never withheld. Names compare case-folded, so a
+ * `docs/Checkout/` is withheld with `checkout` on every filesystem rather than
+ * only on the ones that would open it under that name.
+ */
+export async function resolveDesiredDocs(repoPath: string, inactiveNamespaces: readonly string[]): Promise<DesiredDocs> {
+  const sourceDir = path.join(expandHome(repoPath), 'docs');
+  const inactive = new Set(inactiveNamespaces.map(caseFoldKey));
+  const withheldDirs = new Set((await listDirs(sourceDir)).filter((dir) => inactive.has(caseFoldKey(dir))));
+  const files: string[] = [];
+  const withheld = new Map<string, string[]>([...withheldDirs].map((dir) => [dir, []]));
+  for (const file of await listDocFiles(sourceDir)) {
+    const slash = file.indexOf('/');
+    const dirFiles = slash === -1 ? undefined : withheld.get(file.slice(0, slash));
+    if (dirFiles) dirFiles.push(file.slice(slash + 1));
+    else files.push(file);
+  }
+  return { sourceDir, files, withheld: [...withheld].map(([dir, dirFiles]) => ({ dir, files: dirFiles })) };
+}
+
+/**
+ * `resolveDesiredDocs` for a caller that holds no pull context (recall,
+ * contribute, doctor): the same namespaces pull resolves. Legacy mode withholds
+ * nothing. Throws when the scope's manifests cannot be read, as pull stops the
+ * scope then.
+ */
+export async function resolveDocsForDirectory(localConfig: LocalConfig): Promise<DesiredDocs> {
+  const resolved = await resolveResourceNamespaces(localConfig);
+  return resolveDesiredDocs(localConfig.repo.localPath, resolved?.inactiveDocsNamespaces ?? []);
+}
+
+/** The file's bytes, or null when it is not a file this process can read. */
+async function readBytes(filePath: string): Promise<Buffer | null> {
+  try {
+    return await fs.readFile(filePath);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Remove the local copies of the docs `desired` withholds, the way a
+ * deactivated namespace's skills and agents go: only a copy byte-equal to the
+ * team file, now or in an earlier commit, is deleted. An older version is what
+ * the mirror delivered before the team edited it, not a member edit. An edited
+ * one is kept and named, so nothing a member wrote over a team doc is lost. A
+ * local file the team repo does not have is the mirror's to prune, as anywhere
+ * else in the destination.
+ */
+async function withdrawInactiveNamespaces(desired: DesiredDocs, localDocsDir: string, localConfig: LocalConfig): Promise<void> {
+  for (const { dir, files } of desired.withheld) {
+    const kept: string[] = [];
+    for (const file of files) {
+      const deployed = path.join(localDocsDir, dir, file);
+      const current = await readBytes(deployed);
+      if (current === null) continue;
+      const source = await readBytes(path.join(desired.sourceDir, dir, file));
+      const unchanged = source !== null && (current.equals(source)
+        || await isPastVersionOf(localConfig.repo.localPath, deployed, `docs/${dir}/${file}`));
+      if (!unchanged) {
+        kept.push(`${dir}/${file}`);
+        continue;
+      }
+      await fs.rm(deployed, { force: true });
+      log.debug(`[${localConfig.scope}] Removed ${dir}/${file} of inactive docs namespace "${dir}"`);
+    }
+    await pruneEmptyDirs(path.join(localDocsDir, dir));
+    if (kept.length > 0) {
+      log.warn(
+        `[${localConfig.scope}] Kept ${kept.length} doc(s) of docs namespace "${dir}", which is not active here: `
+        + `they differ from the team copy (${kept.join(', ')} in ${localDocsDir}). Back them up, then delete them manually.`,
+      );
+    }
+  }
 }
 
 export class DocsHandler extends ResourceHandler {
@@ -182,27 +283,39 @@ export class DocsHandler extends ResourceHandler {
   }
 
   /**
-   * Mirror non-hidden docs from the team repo to the dedicated local directory.
+   * Mirror the docs this directory receives into the dedicated local
+   * directory. `pull` resolves the set once and calls `pullDocs`.
    */
-  async pullItem(item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
+  async pullItem(_item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
+    await this.pullDocs(await resolveDocsForDirectory(localConfig), teamConfig, localConfig);
+  }
+
+  /**
+   * Mirror `desired` into the dedicated local directory: copy the delivered
+   * files, remove every visible local entry the team repo does not have, then
+   * withdraw the unchanged copies of a namespace not active here (#707).
+   */
+  async pullDocs(desired: DesiredDocs, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
     const localDocsDir = resolveDocsDestination(teamConfig, localConfig);
-    const src = expandHome(item.sourcePath);
+    const src = desired.sourceDir;
     // Validate the source before touching the destination, including an empty bundle.
     const entries = await readEntries(src);
     await fse.ensureDir(localDocsDir);
     const destination = await fse.realpath(localDocsDir);
     const repo = await fse.realpath(localConfig.repo.localPath);
     const base = await fse.realpath(resolveBaseDir(localConfig));
-    // In single-repo mode the configured docs directory may already be the source.
+    // In single-repo mode the configured docs directory may already be the
+    // source. Withdrawing there would delete the team's own files.
     if (destination === path.join(repo, 'docs')) return;
     if (containsPath(destination, base) || containsPath(destination, repo) || containsPath(repo, destination)) {
       throw new Error('Docs pruning requires a dedicated localDir that does not overlap the team repo or contain the home or project root.');
     }
     if (entries.length > 0) {
-      await copyDocs(src, localDocsDir);
+      await copyDocs(src, localDocsDir, new Set(desired.withheld.map(({ dir }) => dir)));
     }
     // Copy first: a failed copy must not trigger deletion of the previous bundle.
     await pruneDocs(src, localDocsDir);
+    await withdrawInactiveNamespaces(desired, localDocsDir, localConfig);
     log.debug(`Synced docs → ${localDocsDir}`);
   }
 

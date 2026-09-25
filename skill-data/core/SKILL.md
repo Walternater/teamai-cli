@@ -105,8 +105,9 @@ teamai recall <q>  # Search what the team has already learned
 Every other command, every flag, and the flags `--help` hides live in the
 generated reference below. Read it instead of guessing a flag.
 
-`teamai pull` mirrors non-hidden docs into `sharing.docs.localDir`, removing stale
-and local-only documents. Use a dedicated directory; preview with `--dry-run`.
+`teamai pull` mirrors the non-hidden docs you receive into `sharing.docs.localDir`,
+removing stale and local-only documents; an edited doc of a docs namespace you left
+is kept and named. Use a dedicated directory; preview with `--dry-run`.
 
 ## References
 

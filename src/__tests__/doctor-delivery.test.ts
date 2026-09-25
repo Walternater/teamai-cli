@@ -354,6 +354,49 @@ describe('doctor — skills delivered on disk', () => {
       expect(await docsCheck()).toBeUndefined();
     });
 
+    // The same filter pull applies (#707): a declared namespace this member
+    // does not have active is not owed, and an active one is.
+    it('does not expect the docs of a namespace declared elsewhere, and does expect the active one', async () => {
+      await fse.outputFile(
+        path.join(repoPath, 'manifest', 'projects.yaml'),
+        'version: 1\nprojects:\n  - id: alpha\n    resources:\n      docs: [alpha]\n  - id: beta\n    resources:\n      docs: [beta]\n',
+      );
+      localConfig.projects = ['alpha'];
+      await writeTeamDoc('guide.md');
+      await writeTeamDoc('alpha', 'gateway.md');
+      await writeTeamDoc('beta', 'billing.md');
+      await fse.outputFile(path.join(homeDir, 'team-docs', 'guide.md'), '# doc\n');
+
+      const check = await docsCheck();
+
+      expect(await check!.check()).toBe(false);
+      expect(check!.fix).toContain('alpha/gateway.md');
+      expect(check!.fix).not.toContain('beta');
+
+      await fse.outputFile(path.join(homeDir, 'team-docs', 'alpha', 'gateway.md'), '# doc\n');
+      expect(await (await docsCheck())!.check()).toBe(true);
+    });
+
+    // Pull keeps an edited copy of an inactive namespace's doc and names it, so
+    // doctor does not call it stale; a file the team has nowhere still is.
+    it('does not report a kept doc of an inactive namespace as stale, only a file the team lacks', async () => {
+      await fse.outputFile(
+        path.join(repoPath, 'manifest', 'projects.yaml'),
+        'version: 1\nprojects:\n  - id: alpha\n    resources:\n      docs: [alpha]\n  - id: beta\n    resources:\n      docs: [beta]\n',
+      );
+      localConfig.projects = ['alpha'];
+      await writeTeamDoc('beta', 'billing.md');
+      await fse.outputFile(path.join(homeDir, 'team-docs', 'beta', 'billing.md'), '# my notes\n');
+
+      expect(await (await docsCheck())!.check()).toBe(true);
+
+      await fse.outputFile(path.join(homeDir, 'team-docs', 'beta', 'retired.md'), '# gone upstream\n');
+      const check = await docsCheck();
+      expect(await check!.check()).toBe(false);
+      expect(check!.fix).toContain('beta/retired.md');
+      expect(check!.fix).not.toContain('billing.md');
+    });
+
     it('reports missing and stale docs together without changing local files', async () => {
       await writeTeamDoc('guide.md');
       const stale = path.join(homeDir, 'team-docs', 'old', 'retired.md');

@@ -55,7 +55,6 @@ export async function rebuildIndexAfterContribute(localConfig: LocalConfig): Pro
   const repoPath = localConfig.repo.localPath;
   const docsRepoDir = path.join(repoPath, 'docs');
   const rulesRepoDir = path.join(repoPath, 'rules');
-  const skillsRepoDir = path.join(repoPath, 'skills');
   const votesDir = path.join(getReportsDir(localConfig), 'votes');
 
   const activeLearningsNamespaces = await resolveActiveLearningsNamespaces(
@@ -66,6 +65,7 @@ export async function rebuildIndexAfterContribute(localConfig: LocalConfig): Pro
   const teamaiHome = getDataHome(localConfig);
   const indexPath = path.join(teamaiHome, 'search-index.json');
   const { buildIndex } = await import('./utils/search-index.js');
+  const { deliveredIndexSources } = await import('./resources/desired.js');
   await buildIndex({
     learningsDirs: [
       pendingLearningsDir(localConfig),
@@ -76,7 +76,8 @@ export async function rebuildIndexAfterContribute(localConfig: LocalConfig): Pro
     learningsNamespaces: activeLearningsNamespaces,
     docsDir: (await pathExists(docsRepoDir)) ? docsRepoDir : undefined,
     rulesDir: (await pathExists(rulesRepoDir)) ? rulesRepoDir : undefined,
-    skillsDir: (await pathExists(skillsRepoDir)) ? skillsRepoDir : undefined,
+    // The docs and skills pull delivers here, not the whole trees (#707).
+    ...await deliveredIndexSources(localConfig),
     votesDir: (await pathExists(votesDir)) ? votesDir : undefined,
     indexPath,
   });

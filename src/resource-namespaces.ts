@@ -9,9 +9,14 @@ import {
 } from './roles.js';
 import { loadProjectsManifest, resolveProjectResourceNamespaces, mergeNamespaces, projectNamespaceEntries } from './projects.js';
 import { assertNoCaseAliasedNamespaces } from './manifest-schema.js';
-import { log } from './utils/logger.js';
+import { warnOnce } from './utils/warn-once.js';
 
-/** Resolve the same role/project activation policy for resource pull and push. */
+/**
+ * Resolve the same role/project activation policy for resource pull and push.
+ *
+ * The fallback warnings are said once per run: a pull resolves this for every
+ * type and again for hooks, MCP and models after the scopes.
+ */
 export async function resolveResourceNamespaces(localConfig: LocalConfig) {
   const activeProjects = localConfig.projects ?? [];
   const primaryRole = localConfig.primaryRole;
@@ -39,7 +44,7 @@ export async function resolveResourceNamespaces(localConfig: LocalConfig) {
     // to gate. Let it fail the scope's pull, as an invalid projects manifest
     // already does.
     if (!(error instanceof RolesManifestNotFoundError)) throw error;
-    if (primaryRole) log.warn('Roles manifest not found. Skipping role-based filtering.');
+    if (primaryRole) warnOnce('Roles manifest not found. Skipping role-based filtering.');
   }
 
   // When there is nothing to filter by AND the team does not use project
@@ -76,8 +81,8 @@ export async function resolveResourceNamespaces(localConfig: LocalConfig) {
         });
         allRoleSkillNamespaces = new Set(rolesManifest.roles.flatMap((role) => role.resources.skills));
       } catch {
-        log.warn(`Role "${localConfig.primaryRole}" not found in manifest. Falling back to unfiltered sync.`);
-        log.warn('Run `teamai roles set <role>` to pick a valid role.');
+        warnOnce(`Role "${localConfig.primaryRole}" not found in manifest. Falling back to unfiltered sync.`);
+        warnOnce('Run `teamai roles set <role>` to pick a valid role.');
         // A misconfigured role, with nothing else to scope by, can't filter safely.
         if (!hasProjects && !teamHasProjects) return null;
       }
@@ -102,11 +107,11 @@ export async function resolveResourceNamespaces(localConfig: LocalConfig) {
           activeProjects,
         });
       } catch (e) {
-        log.warn(`${e instanceof Error ? e.message : String(e)} Falling back to role-only filtering.`);
+        warnOnce(`${e instanceof Error ? e.message : String(e)} Falling back to role-only filtering.`);
       }
     }
   } else if (hasProjects) {
-    log.warn('Active projects configured but no projects manifest found. Skipping project-based filtering.');
+    warnOnce('Active projects configured but no projects manifest found. Skipping project-based filtering.');
   }
 
   const activeNamespaces = mergeNamespaces(roleNamespaces, projectNamespaces);
@@ -114,5 +119,32 @@ export async function resolveResourceNamespaces(localConfig: LocalConfig) {
   // Skill activation set spans BOTH dimensions: a skill is inactive only if it
   // lives in a namespace that neither an active role nor an active project selects.
   const allSkillNamespaces = new Set<string>([...allRoleSkillNamespaces, ...allProjectSkillNamespaces]);
-  return { activeNamespaces, allSkillNamespaces };
+
+  // Docs are declared, not held: a docs/<dir>/ that ANY role or project lists is
+  // a namespace, whether or not this member holds that role, and reaches only
+  // the members who have it active. Every other docs/<dir>/ stays shared.
+  const declaredDocsNamespaces = new Set<string>([
+    ...(rolesManifest?.roles ?? []).flatMap((role) => role.resources.docs ?? []),
+    ...(projectsManifest?.projects ?? []).flatMap((project) => project.resources.docs ?? []),
+  ]);
+  const activeDocs = new Set(activeNamespaces.docs ?? []);
+  const inactiveDocsNamespaces = [...declaredDocsNamespaces].filter((namespace) => !activeDocs.has(namespace));
+
+  return { activeNamespaces, allSkillNamespaces, inactiveDocsNamespaces };
+}
+
+/**
+ * True in legacy mode: no role and no project filters this directory, so every
+ * namespace is delivered beside the shared root. Callers use it to decide
+ * whether a legacy-only step applies: withdrawing a placement record that a
+ * shared-root file now shadows, or letting that root file keep its path. A
+ * manifest that cannot be read answers false, the side that withdraws and
+ * overwrites nothing; whatever needs the namespaces themselves reports it.
+ */
+export async function deliversEveryNamespace(localConfig: LocalConfig): Promise<boolean> {
+  try {
+    return await resolveResourceNamespaces(localConfig) === null;
+  } catch {
+    return false;
+  }
 }

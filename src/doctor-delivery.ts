@@ -3,7 +3,8 @@ import fs from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { expandHome, listFilesRecursive, pathExists, readFileSafe } from './utils/fs.js';
 import { getDataHome, getMcpSharing, isAgentExcluded } from './types.js';
-import type { DeliveryTarget, ResourceItem } from './types.js';
+import type { DeliveryTarget, LocalConfig, ResourceItem, TeamaiConfig } from './types.js';
+import type { EntryResolution, EntryType } from './namespaced-entries.js';
 import { splitFrontmatter } from './utils/frontmatter.js';
 import type { ResourceHandler } from './resources/base.js';
 import type { Check, DoctorContext } from './doctor.js';
@@ -143,30 +144,37 @@ function nameList(names: string[]): string {
  * The scan runs here rather than inside `check()` because the fix names the
  * skills that are missing, and a `Check`'s fix is read as it was built.
  */
+/**
+ * The one check for a type whose desired set cannot be resolved: two active
+ * namespaces collide, or a manifest cannot be read. `pull` reports the same
+ * reason, and the command whose job is explaining bad state must report it,
+ * not stack-trace on it.
+ */
+function unresolvableCheck(type: 'skills' | 'agents' | 'docs', reason: string): Check[] {
+  const noun = type[0].toUpperCase() + type.slice(1);
+  return [{
+    name: `${noun} to deliver can be resolved`,
+    source: 'local',
+    check: async () => false,
+    fix: `${reason}. Until the team repo is fixed, pull cannot sync ${type} for this role.`,
+  }];
+}
+
 export async function buildDeliveryChecks(ctx: DoctorContext): Promise<Check[]> {
   const { localConfig, teamConfig } = ctx;
   if (!teamConfig) return [];
 
-  // Dynamic: pull.ts imports this module for its post-pull pass, and the desired
-  // set is policy that must not be restated here.
-  const { buildRolePullContext, resolveDesiredSkills } = await import('./pull.js');
+  // The desired set is policy that must not be restated here.
+  const { buildRolePullContext, describeDeliveryConflict, resolveDesiredSkills } = await import('./resources/desired.js');
   const { getHandler } = await import('./resources/index.js');
 
   let items: ResourceItem[];
   try {
-    const roleContext = await buildRolePullContext(localConfig);
-    ({ items } = await resolveDesiredSkills(teamConfig, localConfig, roleContext));
+    const desired = await resolveDesiredSkills(teamConfig, localConfig, await buildRolePullContext(localConfig));
+    if (desired.kind === 'conflict') return unresolvableCheck('skills', describeDeliveryConflict(desired));
+    ({ items } = desired);
   } catch (e) {
-    // A team repo whose active namespaces collide cannot say what should be
-    // delivered — `pull` aborts the scope with this same message. The command
-    // whose job is explaining bad state must report it, not stack-trace on it.
-    return [{
-      name: 'Skills to deliver can be resolved',
-      source: 'local',
-      check: async () => false,
-      fix: `${(e as Error).message}. Until the team repo is fixed, `
-        + 'pull cannot sync skills for this role.',
-    }];
+    return unresolvableCheck('skills', e instanceof Error ? e.message : String(e));
   }
   if (items.length === 0) return [];
 
@@ -200,7 +208,7 @@ export async function buildRulesDeliveryChecks(ctx: DoctorContext): Promise<Chec
   const { localConfig, teamConfig } = ctx;
   if (!teamConfig) return [];
 
-  const { buildRolePullContext, resolveDesiredRules } = await import('./pull.js');
+  const { buildRolePullContext, resolveDesiredRules } = await import('./resources/desired.js');
   const { getHandler } = await import('./resources/index.js');
 
   const roleContext = await buildRolePullContext(localConfig);
@@ -335,24 +343,17 @@ export async function buildAgentsDeliveryChecks(ctx: DoctorContext): Promise<Che
   const { localConfig, teamConfig } = ctx;
   if (!teamConfig) return [];
 
-  const { buildRolePullContext, resolveDesiredAgents } = await import('./pull.js');
+  const { buildRolePullContext, describeDeliveryConflict, resolveDesiredAgents } = await import('./resources/desired.js');
   const { AgentsHandler } = await import('./resources/agents.js');
   const handler = new AgentsHandler();
 
   let items: ResourceItem[];
   try {
-    const roleContext = await buildRolePullContext(localConfig);
-    items = await resolveDesiredAgents(teamConfig, localConfig, roleContext);
+    const desired = await resolveDesiredAgents(teamConfig, localConfig, await buildRolePullContext(localConfig));
+    if (desired.kind === 'conflict') return unresolvableCheck('agents', describeDeliveryConflict(desired));
+    ({ items } = desired);
   } catch (e) {
-    // Two active namespaces claiming one agent name: `pull` aborts the scope
-    // with this message rather than picking one, so `doctor` reports it.
-    return [{
-      name: 'Agents to deliver can be resolved',
-      source: 'local',
-      check: async () => false,
-      fix: `${(e as Error).message}. Until the team repo is fixed, `
-        + 'pull cannot sync agents for this role.',
-    }];
+    return unresolvableCheck('agents', e instanceof Error ? e.message : String(e));
   }
   if (items.length === 0) return [];
 
@@ -429,25 +430,24 @@ export async function buildMcpDeliveryChecks(ctx: DoctorContext): Promise<Check[
     resolveMcpTargets, buildDesiredMcpContext, desiredMcpForTarget,
     mcpTargetExcluded, installedMcpEntries,
   } = await import('./mcp-reconcile.js');
-  const { readMcpYaml, teamMcpToDef, teamMcpYamlPath } = await import('./resources/mcp.js');
+  const { mcpEntryReader, teamMcpToDef } = await import('./resources/mcp.js');
+  const { describeEntryFailure, resolveEntriesFor } = await import('./namespaced-entries.js');
 
-  // A file that does not parse is not a team without MCP: the pull logs the
-  // reason once and injects nothing anywhere, and every later run is silent.
-  // Flattening it to an empty desired set is what let `doctor --json` answer
-  // `ok: true` over a team whose MCP reaches no tool at all.
-  const read = await readMcpYaml(localConfig.repo.localPath);
-  if (!read.ok) {
-    const yamlPath = teamMcpYamlPath(localConfig.repo.localPath);
+  // A file that does not parse, or a server name defined twice, is not a team
+  // without MCP: the pull logs the reason once and changes nothing in any tool,
+  // and every later run is silent. Flattening it to an empty desired set is
+  // what let `doctor --json` answer `ok: true` over a team whose MCP is stuck.
+  const resolution = await resolveEntriesFor(mcpEntryReader, localConfig);
+  if (resolution.kind === 'failed') {
     return [{
       name: 'Team MCP servers can be read',
       source: 'local',
       check: async () => false,
-      fix: `${yamlPath} does not parse: ${read.reason}. No server is injected into any tool `
-        + 'until it is fixed in the team repo and pushed.',
+      fix: describeEntryFailure(resolution.failure),
     }];
   }
 
-  const teamDefs = (read.yaml?.servers ?? []).map(teamMcpToDef);
+  const teamDefs = resolution.entries.map((entry) => teamMcpToDef(entry.entry));
   if (teamDefs.length === 0) return [];
 
   const targets = await resolveMcpTargets(teamConfig, localConfig);
@@ -489,7 +489,7 @@ export async function buildMcpDeliveryChecks(ctx: DoctorContext): Promise<Check[
       source: 'local',
       check: async () => problems.length === 0,
       fix: `In ${target.file}, ${problems.join('; ')}. A server needing a variable reads it from `
-        + '`env/env.yaml`, whose top-level key is `variables:` — a plain `KEY: value` mapping '
+        + '`env/env.yaml` or an active `env/<ns>/env.yaml`, whose top-level key is `variables:` — a plain `KEY: value` mapping '
         + 'parses as no variables at all. Then run `teamai pull --force`: a pull leaves an entry '
         + 'teamai does not own untouched, so a server of your own under a team name only gives '
         + 'way to `--force`.',
@@ -497,6 +497,74 @@ export async function buildMcpDeliveryChecks(ctx: DoctorContext): Promise<Check[
   }
 
   return checks;
+}
+
+/**
+ * The per-entry `roles:` / `projects:` keys that namespace files replace (#707).
+ * `roles:` on hooks and MCP still filters for one minor release and `projects:`
+ * (and `roles:` on env) already reaches nobody; pull warns once per run, and
+ * this is the standing version of that warning, naming each target file.
+ * Informational: every entry still resolves as the warning says.
+ */
+export async function buildEntryScopeKeyCheck(ctx: DoctorContext): Promise<Check[]> {
+  const messages = (await resolveEntryTypes(ctx.localConfig))
+    .flatMap(({ resolution }) => resolution.notices)
+    .filter((notice) => notice.kind !== 'file-note')
+    .map((notice) => notice.message);
+  if (messages.length === 0) return [];
+  return [{
+    name: 'Team env, hooks and MCP are scoped by namespace files, not per-entry keys',
+    source: 'local',
+    informational: true,
+    check: async () => false,
+    fix: messages.join(' '),
+  }];
+}
+
+/**
+ * A failing check for hooks and model profiles that do not resolve: pull keeps
+ * what is installed and says why once, then every later run is silent, and
+ * `teamai status` sends the member here. Env and MCP report the same failure
+ * in their own delivery checks.
+ */
+export async function buildEntryResolutionChecks(ctx: DoctorContext): Promise<Check[]> {
+  const { describeEntryFailure } = await import('./namespaced-entries.js');
+  const names: Partial<Record<EntryType, string>> = {
+    hooks: 'Team hooks can be resolved',
+    models: 'Team model profiles can be resolved',
+  };
+  const checks: Check[] = [];
+  for (const { type, resolution } of await resolveEntryTypes(ctx.localConfig)) {
+    const name = names[type];
+    if (name === undefined || resolution.kind !== 'failed') continue;
+    checks.push({ name, source: 'local', check: async () => false, fix: describeEntryFailure(resolution.failure) });
+  }
+  return checks;
+}
+
+/**
+ * Info lines for `doctor`: which namespace entry replaces which root entry,
+ * and in legacy mode each name the root file repeats. They answer "why do I
+ * have this value?" and are not problems, so they are notes, not checks.
+ */
+export async function entryNamespaceNotes(ctx: DoctorContext): Promise<string[]> {
+  const { describeEntryNotes } = await import('./namespaced-entries.js');
+  return (await resolveEntryTypes(ctx.localConfig)).flatMap(({ type, resolution }) => describeEntryNotes(type, resolution));
+}
+
+async function resolveEntryTypes(localConfig: LocalConfig): Promise<{ type: EntryType; resolution: EntryResolution<unknown> }[]> {
+  if (localConfig.repo.kind === 'http') return [];
+  const { resolveEntriesFor } = await import('./namespaced-entries.js');
+  const { envEntryReader } = await import('./resources/env.js');
+  const { hooksEntryReader } = await import('./resources/hooks.js');
+  const { mcpEntryReader } = await import('./resources/mcp.js');
+  const { modelsEntryReader } = await import('./models/profile.js');
+  return [
+    { type: 'env', resolution: await resolveEntriesFor(envEntryReader, localConfig) },
+    { type: 'hooks', resolution: await resolveEntriesFor(hooksEntryReader, localConfig) },
+    { type: 'mcp', resolution: await resolveEntriesFor(mcpEntryReader, localConfig) },
+    { type: 'models', resolution: await resolveEntriesFor(modelsEntryReader, localConfig) },
+  ];
 }
 
 /**
@@ -546,31 +614,18 @@ async function envDeliveryProblems(
   const none = { problems: [], staleProfiles: [] };
   if (teamConfig?.sharing?.env?.injectShellProfile === false) return none;
 
-  const envYamlPath = path.join(localConfig.repo.localPath, 'env', 'env.yaml');
-  if (!await pathExists(envYamlPath)) return none;
-
-  const { EnvHandler } = await import('./resources/env.js');
+  const { EnvHandler, envEntryReader } = await import('./resources/env.js');
   const envHandler = new EnvHandler();
 
-  // The handler distinguishes a file that parses from one that does not, so a
-  // shorthand `KEY: value` mapping is reported (#662) while a deliberate
-  // `variables: []` is not. Counting the variables alone cannot tell them apart.
-  const read = await envHandler.readEnvYaml(envYamlPath);
-  if (!read.ok) return { problems: [read.reason], staleProfiles: [] };
-
-  // Only the variables this member and directory are scoped to: the same filter
-  // `pullItem` applies, not a second copy of it. Diffing env.sh against every
-  // DECLARED variable would report a project-scoped one as undelivered on a pull
-  // that correctly withheld it.
-  const { resolveDeliverableEnvVariables } = await import('./resources/env.js');
-  const { resolveMembership } = await import('./membership.js');
-  const declared = resolveDeliverableEnvVariables(read.variables, resolveMembership(localConfig));
-  // The variables the filter withheld. `pull` rewrites env.sh from the
-  // deliverable set, so one of these still exported means the file predates a
-  // rebind (`teamai projects set`) or a role change, and the previous
-  // project's secrets are live in every new shell until the next pull.
+  // The variables this member and directory receive: the same resolution pull
+  // writes env.sh from, not a second copy of it. A file that cannot be used, or
+  // a name defined twice, is reported here as pull reports it (#662), and a
+  // deliberate `variables: []` is not.
+  const { resolveEntriesFor, describeEntryFailure } = await import('./namespaced-entries.js');
+  const resolution = await resolveEntriesFor(envEntryReader, localConfig);
+  if (resolution.kind === 'failed') return { problems: [describeEntryFailure(resolution.failure)], staleProfiles: [] };
+  const declared = resolution.entries.map((entry) => entry.entry);
   const deliverable = new Set(declared.map((variable) => variable.key));
-  const withheld = read.variables.filter((variable) => !deliverable.has(variable.key));
   const problems: string[] = [];
 
   // env.sh lives under teamaiHome, which is <projectRoot>/.teamai in project
@@ -604,11 +659,14 @@ async function envDeliveryProblems(
         `${envShPath} has a stale value for ${nameList(stale)}: env.yaml declares a different one`,
       );
     }
-    const leftover = withheld.filter((variable) => delivered.has(variable.key)).map((variable) => variable.key);
+    // env.sh holds only what pull wrote, so a key the resolved set lacks is
+    // left over from before a namespace deactivated or the team removed it,
+    // and still live in every new shell until the next pull.
+    const leftover = [...delivered.keys()].filter((key) => !deliverable.has(key));
     if (leftover.length > 0) {
       problems.push(
-        `${envShPath} still exports ${nameList(leftover)}, which env.yaml no longer delivers to this `
-        + 'directory (its roles: or projects: do not match)',
+        `${envShPath} still exports ${nameList(leftover)}, which the team no longer delivers to this `
+        + 'directory (removed, or its namespace is no longer active)',
       );
     }
     // Nothing is owed, so the profile block has nothing to load: a leftover is
@@ -659,31 +717,46 @@ async function envDeliveryProblems(
 
 /**
  * The docs bundle has one destination rather than one per tool: `DocsHandler`
- * mirrors the visible `docs/` tree into `sharing.docs.localDir`. So this check
- * compares the two trees, file by file, rather than asking each tool.
+ * mirrors the team's visible `docs/` tree into `sharing.docs.localDir`. So this
+ * check compares the delivered set with that directory, file by file, rather
+ * than asking each tool.
  */
 export async function buildDocsCheck(ctx: DoctorContext): Promise<Check[]> {
   const { localConfig, teamConfig } = ctx;
   if (!teamConfig) return [];
 
-  const { listDocFiles, listStaleDocDirectories, resolveDocsDestination } = await import('./resources/docs.js');
+  const { listDocFiles, listStaleDocDirectories, resolveDocsForDirectory, resolveDocsDestination } = await import('./resources/docs.js');
+  // The set pull delivers: no dotfiles, nothing of a docs namespace this member
+  // does not have active (#707). Manifests that cannot be read leave nothing to
+  // compare against, and pull stops the scope over them.
+  let desired: Awaited<ReturnType<typeof resolveDocsForDirectory>>;
+  try {
+    desired = await resolveDocsForDirectory(localConfig);
+  } catch (e) {
+    return unresolvableCheck('docs', e instanceof Error ? e.message : String(e));
+  }
+
   const dest = resolveDocsDestination(teamConfig, localConfig);
-  let teamFiles: string[];
   let localFiles: string[];
   let staleDirectories: string[];
   try {
-    teamFiles = await listDocFiles(path.join(localConfig.repo.localPath, 'docs'));
     localFiles = await listDocFiles(dest);
-    staleDirectories = await listStaleDocDirectories(path.join(localConfig.repo.localPath, 'docs'), dest);
-  } catch (error) {
+    staleDirectories = await listStaleDocDirectories(desired.sourceDir, dest);
+  } catch (e) {
     return [{
       name: 'Team docs delivered', source: 'local', check: async () => false,
-      fix: `Could not inspect the docs mirror: ${(error as Error).message}. Check directory access, then run \`teamai pull --force\`.`,
+      fix: `Could not inspect the docs mirror: ${e instanceof Error ? e.message : String(e)}. Check directory access, then run \`teamai pull --force\`.`,
     }];
   }
+  const teamFiles = desired.files;
   if (teamFiles.length === 0 && localFiles.length === 0 && staleDirectories.length === 0) return [];
-  const expected = new Set(teamFiles);
-  const stale = [...localFiles.filter(file => !expected.has(file)), ...staleDirectories];
+  // A team doc of a namespace not active here is not stale: pull removes the
+  // unchanged copy and names the edited one it keeps.
+  const known = new Set([
+    ...teamFiles,
+    ...desired.withheld.flatMap(({ dir, files }) => files.map((file) => `${dir}/${file}`)),
+  ]);
+  const stale = [...localFiles.filter(file => !known.has(file)), ...staleDirectories];
 
   // isFile, not merely "something is there": a directory sitting on the
   // expected name, or a symlink with nothing behind it, would satisfy a plain
@@ -703,4 +776,81 @@ export async function buildDocsCheck(ctx: DoctorContext): Promise<Check[]> {
       'Run `teamai pull --force` to restore the docs mirror; a plain pull skips an already-synced revision.',
     ].join(' '),
   }];
+}
+
+/**
+ * Information lines, not checks, that answer "why do I have this version?"
+ * (#707). With roles or projects: each namespace skill, agent, rule or
+ * claudemd file that replaces a root item of the same name. In legacy mode,
+ * where nothing replaces anything: each name the team repo defines more than
+ * once, and what the member receives because of it.
+ *
+ * A team repo whose desired sets cannot be resolved yields no lines: the
+ * delivery checks already report that as a failure.
+ */
+export async function buildNamespaceNotes(ctx: DoctorContext): Promise<string[]> {
+  const { localConfig, teamConfig } = ctx;
+  if (!teamConfig) return [];
+
+  const { describeOverride, repeatedNames } = await import('./namespace-resolver.js');
+  let team: Awaited<ReturnType<typeof readNamespaceNoteInputs>>;
+  try {
+    team = await readNamespaceNoteInputs(teamConfig, localConfig);
+  } catch {
+    return [];
+  }
+
+  if (team.mode === 'legacy') {
+    const firstLevelRules = team.rules.filter((rule) => rule.name.split('/').length <= 2);
+    // claudemd file names at the root and one level down, as the block collects them.
+    // listFilesRecursive joins with '/' on every platform.
+    const claudemdFiles = team.claudemdFiles
+      .map((file) => file.split('/'))
+      .filter((segments) => segments.length <= 2 && (segments[segments.length - 1] ?? '').endsWith('.md'));
+    return [
+      ...repeatedNames(team.skills, (item) => item.name, (item) => item.relativePath).map(([name, sources]) => (
+        `skills: "${name}" is defined in ${listed(sources)} (legacy mode: only one of them is installed)`)),
+      ...repeatedNames(firstLevelRules, (item) => path.posix.basename(item.name), (item) => item.relativePath)
+        .map(([name, sources]) => (
+          `rules: "${name}" is defined in ${listed(sources)} (legacy mode: each is delivered at its own path)`)),
+      ...repeatedNames(claudemdFiles, (segments) => segments[segments.length - 1] ?? '', (segments) => `claudemd/${segments.join('/')}`)
+        .map(([name, sources]) => (
+          `claudemd: "${name}" is defined in ${listed(sources)} (legacy mode: all of them are in the managed block)`)),
+    ];
+  }
+
+  return [
+    ...(team.skills.kind === 'resolved' ? team.skills.overrides : []).map((override) => describeOverride('skills', override)),
+    ...(team.agents.kind === 'resolved' ? team.agents.overrides : []).map((override) => describeOverride('agents', override)),
+    ...team.rules.overrides.map((override) => describeOverride('rules', override)),
+    ...team.claudemd.overrides.map((override) => describeOverride('claudemd', override)),
+  ];
+}
+
+/** What `buildNamespaceNotes` reads from the team repo; throws when a manifest cannot be read. */
+async function readNamespaceNoteInputs(teamConfig: TeamaiConfig, localConfig: LocalConfig) {
+  const desired = await import('./resources/desired.js');
+  const { getHandler } = await import('./resources/index.js');
+  const roleContext = await desired.buildRolePullContext(localConfig);
+  if (!roleContext) {
+    return {
+      mode: 'legacy' as const,
+      skills: await getHandler('skills').scanTeamForPull(teamConfig, localConfig),
+      rules: await getHandler('rules').scanTeamForPull(teamConfig, localConfig),
+      claudemdFiles: await listFilesRecursive(path.join(localConfig.repo.localPath, 'claudemd')),
+    };
+  }
+  return {
+    mode: 'namespaced' as const,
+    skills: await desired.resolveDesiredSkills(teamConfig, localConfig, roleContext),
+    agents: await desired.resolveDesiredAgents(teamConfig, localConfig, roleContext),
+    rules: await desired.resolveDesiredRules(teamConfig, localConfig, roleContext),
+    claudemd: await desired.collectClaudemdFiles(localConfig.repo.localPath, roleContext),
+  };
+}
+
+function listed(sources: string[]): string {
+  return sources.length <= 2
+    ? sources.join(' and ')
+    : `${sources.slice(0, -1).join(', ')} and ${sources[sources.length - 1]}`;
 }

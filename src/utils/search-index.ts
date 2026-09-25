@@ -534,6 +534,22 @@ async function collectRecursiveMdEntries(
   return out;
 }
 
+/** `collectRecursiveMdEntries` over an explicit list of paths relative to `dir`. */
+async function collectListedMdEntries(
+  dir: string,
+  files: readonly string[],
+  type: KnowledgeType,
+  voteCounts: Map<string, number>,
+): Promise<SearchIndexEntry[]> {
+  const out: SearchIndexEntry[] = [];
+  for (const rel of files) {
+    if (!rel.endsWith('.md')) continue;
+    const e = await entryFromMdFile(path.join(dir, rel), rel, type, voteCounts);
+    if (e) out.push(e);
+  }
+  return out;
+}
+
 /**
  * Collect entries from a skills directory whose layout is
  *   skills/<name>/SKILL.md            (flat)
@@ -568,6 +584,33 @@ async function collectSkillEntries(
   return out;
 }
 
+/**
+ * The skills to index in place of walking `skillsDir`: the directories `pull`
+ * delivers to this member (#707), or, when that set cannot be resolved this
+ * run and pull keeps the installed skills, the skills the index already holds.
+ */
+export type IndexedSkills =
+  | { readonly kind: 'dirs'; readonly dirs: readonly string[] }
+  | { readonly kind: 'keep-indexed' };
+
+/**
+ * Entries for an explicit list of skill directories, each `<dir>/SKILL.md`,
+ * named after the directory (doc_id = skill name) as `collectSkillEntries` does.
+ */
+async function collectSkillDirEntries(
+  dirs: readonly string[],
+  voteCounts: Map<string, number>,
+): Promise<SearchIndexEntry[]> {
+  const out: SearchIndexEntry[] = [];
+  for (const dir of dirs) {
+    const skillMd = path.join(dir, 'SKILL.md');
+    if (!await pathExists(skillMd)) continue;
+    const e = await entryFromMdFile(skillMd, `${path.basename(dir)}.md`, 'skills', voteCounts);
+    if (e) out.push(e);
+  }
+  return out;
+}
+
 /** Options for the multi-category build. */
 export interface BuildIndexOptions {
   /** One learnings root. Equivalent to `learningsDirs: [dir]`. */
@@ -587,8 +630,26 @@ export interface BuildIndexOptions {
    */
   learningsNamespaces?: string[];
   docsDir?: string;
+  /**
+   * The docs to index, relative to `docsDir`, in place of walking all of it:
+   * the set `pull` delivers to this member (#707), so recall does not return
+   * docs of a namespace the member does not have.
+   */
+  docFiles?: readonly string[];
   rulesDir?: string;
+  /**
+   * The rules to index, relative to `rulesDir`, in place of walking all of it:
+   * the set `pull` delivers to this member (#707), so recall returns neither a
+   * root rule a namespace replaces nor a rule of an inactive namespace.
+   */
+  ruleFiles?: readonly string[];
+  /**
+   * Every skill under this directory. A member's index passes `skills`
+   * instead; `viz` indexes a whole knowledge repo, not one member's view.
+   */
   skillsDir?: string;
+  /** In place of `skillsDir`: the skills this member receives, so recall does not return others. */
+  skills?: IndexedSkills;
   codebaseDir?: string;
   votesDir?: string;
   indexPath?: string;
@@ -627,13 +688,22 @@ export async function buildIndex(
   if (learningsDirs.length > 0) {
     entries.push(...await collectLearningsEntries(learningsDirs, opts.learningsNamespaces, voteCounts));
   }
-  if (opts.docsDir) {
+  if (opts.docsDir && opts.docFiles) {
+    entries.push(...await collectListedMdEntries(opts.docsDir, opts.docFiles, 'docs', voteCounts));
+  } else if (opts.docsDir) {
     entries.push(...await collectRecursiveMdEntries(opts.docsDir, 'docs', voteCounts));
   }
-  if (opts.rulesDir) {
+  if (opts.rulesDir && opts.ruleFiles) {
+    entries.push(...await collectListedMdEntries(opts.rulesDir, opts.ruleFiles, 'rules', voteCounts));
+  } else if (opts.rulesDir) {
     entries.push(...await collectRecursiveMdEntries(opts.rulesDir, 'rules', voteCounts));
   }
-  if (opts.skillsDir) {
+  if (opts.skills?.kind === 'dirs') {
+    entries.push(...await collectSkillDirEntries(opts.skills.dirs, voteCounts));
+  } else if (opts.skills?.kind === 'keep-indexed') {
+    const previous = await loadIndex(opts.indexPath ?? getSearchIndexPath());
+    entries.push(...(previous?.entries ?? []).filter((entry) => entry.type === 'skills'));
+  } else if (opts.skillsDir) {
     entries.push(...await collectSkillEntries(opts.skillsDir, voteCounts));
   }
   if (opts.codebaseDir) {
