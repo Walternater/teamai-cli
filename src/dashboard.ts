@@ -121,10 +121,11 @@ export async function startDashboard(port?: number): Promise<void> {
             type: 'process_exit',
             timestamp: new Date().toISOString(),
             sessionId: session.sessionId,
+            processExitAfter: session.lastActivity,
             tool: session.tool,
             cwd: session.cwd,
             // The session's own data home, so its scope's report still sees it end.
-            dataHome: events.find((e) => e.sessionId === session.sessionId && e.dataHome)?.dataHome,
+            dataHomeKey: events.find((e) => e.sessionId === session.sessionId && e.dataHomeKey)?.dataHomeKey,
             // And its repo, which the cwd may no longer lead to (a removed worktree).
             projectAnchor: [...events].reverse().find((e) => e.sessionId === session.sessionId && e.projectAnchor)?.projectAnchor,
           };

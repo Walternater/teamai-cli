@@ -195,7 +195,8 @@ describe('one repo, many worktrees (#809)', () => {
   it('stats --by-repo shows one row for the repo, counting its worktree sessions', async () => {
     const r = await runCLI(['stats', '--by-repo'], repo, home);
     expect(r.code, r.output).toBe(0);
-    expect(byRepo(r.output), r.output).toEqual([['my-repo', 5]]);
+    // cd-1 started in HOME: the user scope's, whole (#785), so the repo's own four.
+    expect(byRepo(r.output), r.output).toEqual([['my-repo', 4]]);
   });
 
   it('stats --by-repo labels two unrelated repos with the same name apart', async () => {

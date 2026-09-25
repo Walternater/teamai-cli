@@ -390,23 +390,6 @@ branch, exactly where they are. Nothing is copied, deleted or migrated: that
 directory is still read, so every existing learning keeps coming back from
 `teamai recall`. New learnings go to `teamai-learnings`.
 
-**Removing a skill another project reported into your `stats/`.** Before skill
-usage was kept per scope, whichever project pulled next reported every
-project's skills, so `stats/<user>.yaml` on `teamai-reports` can count a skill
-that belongs to an unrelated repo. Those events recorded no directory, so
-teamai cannot attribute them and never rewrites the file. Remove the entry by
-hand, from a clone of your own so teamai's `reports-wt/` checkout is untouched:
-
-```bash
-git clone --branch teamai-reports --single-branch <team-repo-url> teamai-reports
-cd teamai-reports
-# delete the skill's entry under `skills:` in stats/<user>.yaml
-git commit -am "stats: remove <skill> reported from another project"
-git push origin teamai-reports
-```
-
-The next report reads the branch first, so the entry does not come back.
-
 **Minimum Git permissions with a protected default branch.**
 
 A member needs to:
@@ -1772,15 +1755,23 @@ reported snapshots. Skill usage is recorded per scope, in the data directory of
 the project teamai is set up for where the session ran (or the user scope), so
 each target reports only its own; a directory without teamai records none.
 Dashboard sessions stay in one machine-wide `~/.teamai/dashboard/events.jsonl`,
-but each event records the data home of its scope, so a scope reports only the
-sessions recorded in it: a user-scope pull no longer reports a project's
-sessions, and a project reports its Copilot sessions and sessions started under
-a symlinked path. Events recorded by an earlier release carry no data home: a
-project reports those whose directory lies under its root, the user scope
-reports none of them. Each scope also keeps its own snapshot of what it already
-reported, so a session that moved into another project mid-session reaches both
-teams with the part recorded in each; the first report after upgrading starts
-from the snapshot every scope used to share, so nothing is reported twice. A
+but each event records a key of its scope's data home (a hash, not the path),
+so a scope reports only the sessions recorded in it: a user-scope pull no
+longer reports a project's sessions, and a project reports its Copilot sessions
+and sessions started under a symlinked path. A session is reported once, whole,
+by the scope it started in, even if it later moves into another project: its
+Stop carries the whole transcript's totals, so a second scope would count them
+again. Events recorded by an earlier release carry no key: the scope their
+directory resolves to now reports them (a nested clone under a project resolves
+to its own project or the user scope, not the enclosing project); events with
+no directory, or one removed since, are reported by no one. Each scope also
+keeps its own snapshot of what it already reported, and a session under a
+reused fallback ID (Copilot's PID-based ID when it sends none) counts as new,
+whichever scope reported the earlier one, while a resumed session
+(`claude --resume`) keeps its ID and stays one session, reported by the scope
+that first reported it wherever it is resumed; the first
+report after upgrading starts from the snapshot every scope used to share, so
+nothing is reported twice. A
 target removes its usage events only after it confirms success; failed pushes
 preserve them, up to the newest 5,000 (see below). The affected sync locks remain
 held until reporting finishes, preventing another pull from racing the report.
@@ -1814,6 +1805,23 @@ the usage file (owner-only while there is none). An in-workspace
 files; `pull` and `push` add those entries to an existing single-repo one, and
 the usage file's first pending file or rewrite adds them to an existing
 project-scope one.
+
+**Removing a skill another project reported into your `stats/`.** Before skill
+usage was kept per scope, whichever project pulled next reported every
+project's skills, so `stats/<user>.yaml` on `teamai-reports` can count a skill
+that belongs to an unrelated repo. Those events recorded no directory, so
+teamai cannot attribute them and never rewrites the file. Remove the entry by
+hand, from a clone of your own so teamai's `reports-wt/` checkout is untouched:
+
+```bash
+git clone --branch teamai-reports --single-branch <team-repo-url> teamai-reports
+cd teamai-reports
+# delete the skill's entry under `skills:` in stats/<user>.yaml
+git commit -am "stats: remove <skill> reported from another project"
+git push origin teamai-reports
+```
+
+The next report reads the branch first, so the entry does not come back.
 
 ### Git submodules
 

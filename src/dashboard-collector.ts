@@ -7,7 +7,7 @@ import { deriveSessionId } from './utils/session-id.js';
 import { resolveHookCwd } from './utils/hook-cwd.js';
 import { ensureDir } from './utils/fs.js';
 import { repoKeys, repoLabel } from './utils/repo-attribution.js';
-import { resolveMonitorPid } from './pid-monitor.js';
+import { isProcessAlive, resolveMonitorPid } from './pid-monitor.js';
 import { normalizeToolName } from './utils/tool-names.js';
 import { redactWithEnv } from './utils/redact.js';
 import {
@@ -48,7 +48,7 @@ import { estimateClaudeRequest } from './model-pricing.js';
 //      │ extract: session_id / cwd / tool_name / prompt
 //      ▼
 //  DashboardEvent
-//      │ dataHome = data home of the scope the hook resolved
+//      │ dataHomeKey = key of the data home of the scope the hook resolved
 //      ▼
 //  appendEvent(event) → events.jsonl
 //
@@ -224,6 +224,30 @@ interface JsonlTranscriptScan {
 }
 
 /** Scan the Claude/Codex JSONL transcript once. */
+/**
+ * Whether a Claude transcript entry is a human turn, what the Stop scan counts
+ * as a prompt: plain-string user content, or user content with text that is
+ * neither an interrupt marker nor a system injection; never meta or sidechain.
+ * One human turn per user entry (tool_result-only entries have no human text).
+ */
+export function isHumanPromptEntry(entry: unknown): boolean {
+  if (!entry || typeof entry !== 'object' || !('type' in entry) || entry.type !== 'user') return false;
+  if (('isMeta' in entry && entry.isMeta === true) || ('isSidechain' in entry && entry.isSidechain === true)) return false;
+  const message = 'message' in entry && entry.message && typeof entry.message === 'object' ? entry.message : undefined;
+  const content: unknown = message && 'content' in message ? message.content : undefined;
+  if (typeof content === 'string') {
+    const text = content.trim();
+    return !!text && !text.startsWith(TRANSCRIPT_INTERRUPT_PREFIX) && !TRANSCRIPT_SYSTEM_PREFIXES.some((p) => text.startsWith(p));
+  }
+  if (!Array.isArray(content)) return false;
+  return content.some((item: unknown) => {
+    if (!item || typeof item !== 'object' || !('type' in item) || item.type !== 'text' || !('text' in item)) return false;
+    if (typeof item.text !== 'string' || item.text.startsWith(TRANSCRIPT_INTERRUPT_PREFIX)) return false;
+    const text = item.text.trim();
+    return !!text && !TRANSCRIPT_SYSTEM_PREFIXES.some((p) => text.startsWith(p));
+  });
+}
+
 async function scanJsonlTranscriptOnce(transcriptPath: string, modelAliases?: Record<string, string>): Promise<JsonlTranscriptScan> {
   let interrupt = 0;
   let toolReject = 0;
@@ -352,33 +376,13 @@ async function scanJsonlTranscriptOnce(transcriptPath: string, modelAliases?: Re
 
       if (entry.type !== 'user') continue;
 
-      const isMeta = entry.isMeta === true || entry.isSidechain === true;
+      if (isHumanPromptEntry(entry)) prompts++;
       const content = entry.message?.content;
-
-      // Plain-string user content = a genuine human prompt (older transcript shape).
-      if (typeof content === 'string') {
-        const trimContent = content.trim();
-        if (
-          !isMeta &&
-          trimContent &&
-          !trimContent.startsWith(TRANSCRIPT_INTERRUPT_PREFIX) &&
-          !TRANSCRIPT_SYSTEM_PREFIXES.some((p) => trimContent.startsWith(p))
-        ) {
-          prompts++;
-        }
-        continue;
-      }
       if (!Array.isArray(content)) continue;
 
-      let hasHumanText = false;
       for (const item of content as Array<Record<string, unknown>>) {
         if (item?.type === 'text' && typeof item.text === 'string') {
-          const txt = item.text.trim();
-          if (item.text.startsWith(TRANSCRIPT_INTERRUPT_PREFIX)) {
-            interrupt++;
-          } else if (txt && !TRANSCRIPT_SYSTEM_PREFIXES.some((p) => txt.startsWith(p))) {
-            hasHumanText = true;
-          }
+          if (item.text.startsWith(TRANSCRIPT_INTERRUPT_PREFIX)) interrupt++;
         } else if (item?.type === 'tool_result' && item.is_error === true) {
           const text = typeof item.content === 'string'
             ? item.content
@@ -395,8 +399,6 @@ async function scanJsonlTranscriptOnce(transcriptPath: string, modelAliases?: Re
           }
         }
       }
-      // One human turn per user entry (tool_result-only entries have no human text).
-      if (hasHumanText && !isMeta) prompts++;
     }
   } catch (e) {
     log.warn(`dashboard: failed to scan transcript: ${(e as Error).message}`);
@@ -784,7 +786,8 @@ async function waitForCopilotRunUsage(
 }
 
 /** Resolve Copilot's local event log without accepting path traversal via sessionId. */
-function resolveCopilotUsageTranscript(
+/** Copilot's own session log for `sessionId`, derived from the ID alone (TeamAI stores no path of it, #666). */
+export function resolveCopilotUsageTranscript(
   sessionId: string,
 ): string | null {
   if (!COPILOT_SESSION_ID_RE.test(sessionId) || sessionId === '.' || sessionId === '..') return null;
@@ -1225,6 +1228,15 @@ export async function parseHookEvent(
     if (!isCopilot) event.promptSummary = redactWithEnv(human).slice(0, 200);
   }
 
+  // The transcript a session runs in records where it started, which a report
+  // needs once compaction dropped the session's earlier events (#785). A
+  // SessionStart on a resume from another project names a file that never
+  // exists, so it is not kept there.
+  if ((eventType === 'prompt_submit' || eventType === 'session_end') && !isCopilot
+    && typeof hookData.transcript_path === 'string') {
+    event.transcriptPath = hookData.transcript_path;
+  }
+
   // Extract transcript path, AI output and intervention counts from Stop event
   if (eventType === 'stop' && !isCopilot && typeof hookData.transcript_path === 'string') {
     event.transcriptPath = hookData.transcript_path;
@@ -1479,6 +1491,22 @@ export async function reconcileRequestLog(
     await lock?.close().catch(() => undefined);
     if (lock) await fs.promises.unlink(lockPath).catch(() => undefined);
   }
+}
+
+/**
+ * The key an event records for the scope that wrote it, and that a scope's
+ * report matches (#785): a hash of the data home, so the log stores no path
+ * (Copilot events persist none, #666). The data home is realpath'd, so a
+ * symlinked checkout or macOS `/tmp` vs `/private/tmp` keys the same; a
+ * Windows path also folds separators and case, as the report's cwd rule does.
+ * A data home that is gone (an in-repo `.teamai` removed after migration)
+ * keys through its parent's realpath.
+ */
+export async function dataHomeKey(dataHome: string): Promise<string> {
+  const real = await fs.promises.realpath(dataHome).catch(() => !path.isAbsolute(dataHome) ? dataHome
+    : fs.promises.realpath(path.dirname(dataHome)).then((p) => path.join(p, path.basename(dataHome)), () => dataHome));
+  const norm = /^(?:[A-Za-z]:[\\/]|\\\\)/.test(real) ? real.replace(/\\/g, '/').toLowerCase() : real;
+  return createHash('sha256').update(norm.replace(/\/+$/, '')).digest('hex').slice(0, 16);
 }
 
 /**
@@ -1809,12 +1837,73 @@ export function aggregateSessionMetrics(
   const unscopedTokens = new Map<string, TimedTokenSnapshot>();
   const sessionTokens = new Map<string, TimedTokenSnapshot>();
   const transcriptTokens = new Map<string, Map<string, TimedTokenSnapshot>>();
+  // Per rollout, for a transcript-scoped session (Codex), whose counters restart
+  // with each rollout: see SessionMetrics.segments.
+  const rolloutSessions = new Set<string>();
+  const transcriptPrompts = new Map<string, Map<string, number>>();
+  const transcriptInterventions = new Map<string, Map<string, { interrupt: number; toolReject: number }>>();
+  const transcriptRequests = new Map<string, Map<string, Record<string, RequestCostMetrics>>>();
+  const transcriptCorrections = new Map<string, Map<string, number>>();
+  const transcriptErrors = new Map<string, Set<string>>();
+  const transcriptSubmits = new Map<string, Map<string, number>>();
+  const stopAt = new Map<string, Map<string, number>>();
+  const transcriptSince = new Map<string, Map<string, string>>();
+  const lastTranscript = new Map<string, string>();
+  const timeline = new Map<string, Array<{ at: number; transcript: string | undefined }>>();
 
   for (const event of events) {
     let m = map.get(event.sessionId);
     if (!m) {
       m = { interrupt: 0, toolReject: 0, correction: 0, prompts: 0, tokens: emptyTokenUsage() };
       map.set(event.sessionId, m);
+    }
+    if (typeof event.transcriptPath === 'string') {
+      const since = transcriptSince.get(event.sessionId) ?? new Map<string, string>();
+      const first = since.get(event.transcriptPath);
+      if (first === undefined || Date.parse(event.timestamp) < Date.parse(first)) since.set(event.transcriptPath, event.timestamp);
+      transcriptSince.set(event.sessionId, since);
+      lastTranscript.set(event.sessionId, event.transcriptPath);
+    }
+    if (event.tokenScope === 'transcript' || (isCodexTool(event.tool) && typeof event.transcriptPath === 'string')) {
+      rolloutSessions.add(event.sessionId);
+    }
+    const events = timeline.get(event.sessionId) ?? [];
+    const rolloutOf = event.transcriptPath ?? lastTranscript.get(event.sessionId);
+    events.push({ at: Date.parse(event.timestamp), transcript: rolloutOf });
+    timeline.set(event.sessionId, events);
+    if (event.status === 'error' && rolloutOf !== undefined) {
+      transcriptErrors.set(event.sessionId, (transcriptErrors.get(event.sessionId) ?? new Set<string>()).add(rolloutOf));
+    }
+    if (event.type === 'prompt_submit' && rolloutOf !== undefined) {
+      const submits = transcriptSubmits.get(event.sessionId) ?? new Map<string, number>();
+      submits.set(rolloutOf, (submits.get(rolloutOf) ?? 0) + 1);
+      transcriptSubmits.set(event.sessionId, submits);
+    }
+    if (event.type === 'stop' && typeof event.transcriptPath === 'string') {
+      const rollout = event.transcriptPath;
+      // The latest Stop by its timestamp, as for tokens: background Stop
+      // handlers may append an older scan after a newer one.
+      const at = Date.parse(event.timestamp);
+      const latest = stopAt.get(event.sessionId) ?? new Map<string, number>();
+      const seen = latest.get(rollout);
+      const newest = seen === undefined || !Number.isFinite(at) || !Number.isFinite(seen) || at >= seen;
+      if (newest) {
+        latest.set(rollout, at);
+        stopAt.set(event.sessionId, latest);
+      }
+      const record = <T>(maps: Map<string, Map<string, T>>, value: T) => {
+        if (!newest) return;
+        const perRollout = maps.get(event.sessionId) ?? new Map<string, T>();
+        perRollout.set(rollout, value);
+        maps.set(event.sessionId, perRollout);
+      };
+      if (typeof event.prompts === 'number') record(transcriptPrompts, event.prompts);
+      if (event.interventions) {
+        record(transcriptInterventions, { interrupt: event.interventions.interrupt, toolReject: event.interventions.toolReject });
+      }
+      // An older Stop records its cost as one request, on its own day.
+      if (event.requestDaily) record(transcriptRequests, event.requestDaily);
+      else if (event.requestMetrics) record(transcriptRequests, { [event.timestamp.slice(0, 10)]: event.requestMetrics });
     }
 
     if (event.type === 'stop') {
@@ -1835,6 +1924,12 @@ export function aggregateSessionMetrics(
         const isCorrection = event.correction ?? isCorrectionPrompt(event.promptSummary);
         if (gap >= 0 && gap <= CORRECTION_WINDOW_MS && isCorrection) {
           m.correction++;
+          const rollout = event.transcriptPath ?? lastTranscript.get(event.sessionId);
+          if (rollout !== undefined) {
+            const corrections = transcriptCorrections.get(event.sessionId) ?? new Map<string, number>();
+            corrections.set(rollout, (corrections.get(rollout) ?? 0) + 1);
+            transcriptCorrections.set(event.sessionId, corrections);
+          }
         }
         // Each stop is consumed once — a later prompt is a new task, not a correction.
         lastStopAt.delete(event.sessionId);
@@ -1870,6 +1965,7 @@ export function aggregateSessionMetrics(
     if (sessionSnapshot) {
       // The newer thread-level counter already spans rollout files.
       m.tokens = { ...sessionSnapshot.tokens };
+      m.tokensSpanRollouts = true;
     } else if (segments && segments.size > 0) {
       let total = emptyTokenUsage();
       for (const segment of segments.values()) total = addTokenUsage(total, segment.tokens);
@@ -1878,7 +1974,41 @@ export function aggregateSessionMetrics(
       const unscoped = unscopedTokens.get(sid);
       if (unscoped) m.tokens = { ...unscoped.tokens };
     }
-    m.prompts = Math.max(submitCount.get(sid) ?? 0, stopPrompts.get(sid) ?? 0);
+    if (rolloutSessions.has(sid)) {
+      // Active time per rollout: each gap goes to the rollout of the event it ends at.
+      const durations = new Map<string, number>();
+      const own = [...(timeline.get(sid) ?? [])].sort((a, b) => a.at - b.at);
+      for (let i = 1; i < own.length; i++) {
+        const gap = own[i].at - own[i - 1].at;
+        const rollout = own[i].transcript;
+        if (rollout !== undefined && Number.isFinite(gap) && gap >= 0 && gap <= DASHBOARD_IDLE_TIMEOUT_MS) {
+          durations.set(rollout, (durations.get(rollout) ?? 0) + gap);
+        }
+      }
+      const since = transcriptSince.get(sid) ?? new Map<string, string>();
+      m.segments = Object.fromEntries([...since].map(([transcript, first]) => [transcript, {
+        // A Codex Stop may count no prompts: the rollout's submits then do.
+        prompts: Math.max(transcriptPrompts.get(sid)?.get(transcript) ?? 0, transcriptSubmits.get(sid)?.get(transcript) ?? 0),
+        // A session-scoped counter already spans the rollouts: none holds tokens of its own.
+        tokens: { ...(sessionSnapshot ? emptyTokenUsage() : segments?.get(transcript)?.tokens ?? emptyTokenUsage()) },
+        interrupt: transcriptInterventions.get(sid)?.get(transcript)?.interrupt ?? 0,
+        toolReject: transcriptInterventions.get(sid)?.get(transcript)?.toolReject ?? 0,
+        correction: transcriptCorrections.get(sid)?.get(transcript) ?? 0,
+        durationMs: durations.get(transcript) ?? 0,
+        requestDaily: transcriptRequests.get(sid)?.get(transcript) ?? {},
+        since: first,
+        error: transcriptErrors.get(sid)?.has(transcript) ?? false,
+      }]));
+      // A rollout's Stop counts restart too; the session sums them.
+      const sum = (field: 'interrupt' | 'toolReject') =>
+        Object.values(m.segments ?? {}).reduce((total, segment) => total + segment[field], 0);
+      m.interrupt = Math.max(m.interrupt, sum('interrupt'));
+      m.toolReject = Math.max(m.toolReject, sum('toolReject'));
+    }
+    // A rollout's prompt count restarts too: its segments sum where they exist.
+    const rolloutPrompts = m.segments
+      ? Object.values(m.segments).reduce((sum, segment) => sum + segment.prompts, 0) : 0;
+    m.prompts = Math.max(submitCount.get(sid) ?? 0, stopPrompts.get(sid) ?? 0, rolloutPrompts);
   }
 
   return map;
@@ -1901,7 +2031,10 @@ export function aggregateSessionInterventions(
 
 /**
  * Compact events.jsonl by keeping only events for active sessions.
- * Active = not stopped and last activity within STALE_TIMEOUT.
+ * Active = not stopped and last activity within STALE_TIMEOUT, or its tool
+ * process still running: an exit a dashboard wrote before `processExitAfter`
+ * existed can mark a live run stopped, and dropping that run's start would give
+ * its next activity a new run ID (#785).
  * Called when file exceeds COMPACTION_THRESHOLD lines.
  */
 export async function compactEvents(eventsPath?: string): Promise<void> {
@@ -1918,6 +2051,13 @@ export async function compactEvents(eventsPath?: string): Promise<void> {
     const events = await readEventsRaw(filePath);
     const activeSessions = rebuildSessions(events);
     const activeIds = new Set(activeSessions.map(s => s.sessionId));
+    const monitored = new Map<string, number>();
+    for (const e of events) {
+      if (e.type === 'session_start' && typeof e.monitorPid === 'number') monitored.set(e.sessionId, e.monitorPid);
+    }
+    for (const [sessionId, pid] of monitored) {
+      if (isProcessAlive(pid)) activeIds.add(sessionId);
+    }
 
     // Keep only events for active sessions
     const kept = events.filter(e => activeIds.has(e.sessionId));
@@ -1986,7 +2126,7 @@ export async function dashboardReport(toolArg?: string): Promise<void> {
   const event = await parseHookEvent(raw, toolArg ?? 'claude');
   if (!event) return;
 
-  event.dataHome = getDataHome(config);
+  event.dataHomeKey = await dataHomeKey(getDataHome(config));
   event.projectAnchor = await eventProjectAnchor(event.cwd);
   await appendEvent(event);
 

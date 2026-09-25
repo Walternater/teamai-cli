@@ -209,6 +209,9 @@ beforeEach(() => {
   consoleLog = vi.spyOn(console, 'log').mockImplementation(() => undefined);
   initWorkspace();
   DIRS = projectDirs();
+  // An older, unkeyed event counts only while its cwd exists (#785).
+  fs.mkdirSync(DIRS.project, { recursive: true });
+  fs.mkdirSync(DIRS.other, { recursive: true });
 });
 
 afterEach(() => {
@@ -297,11 +300,13 @@ describe('showStats scope and idempotency', () => {
     expect(outputNumber(out, 'Conversation turns:')).toBe(1);
   });
 
-  it('keeps sessions recorded before events carried a data home out of the user scope', async () => {
-    // A user-scope run from a plain directory. These events carry no dataHome,
-    // and the user scope never reports such events (#785), so it does not count
-    // them either: the display side follows the report side.
+  it('leaves a project\'s sessions out of the user scope even when no project resolves for the cwd', async () => {
+    // A user-scope run from a plain directory. The user scope reports only its
+    // own sessions (#785): an older unkeyed session goes to the scope its cwd
+    // resolves to now, so P's stays out and the one elsewhere counts.
     await seedUserScopeWithProject();
+    fs.mkdirSync(DIRS.project, { recursive: true });
+    fs.mkdirSync(DIRS.other, { recursive: true });
     await appendEvents([
       ...session('sess-1', DIRS.project),
       ...session('sess-2', DIRS.other),
@@ -321,7 +326,8 @@ describe('showStats scope and idempotency', () => {
     fs.mkdirSync(plainDir, { recursive: true });
     const out = await showStatsFromPlainDir(plainDir);
 
-    expect(out).toContain('No usage data yet.');
+    expect(outputNumber(out, 'Sessions:')).toBe(1);
+    expect(outputNumber(out, 'Conversation turns:')).toBe(1);
   });
 
   it('subtracts the scope\'s own reported snapshot, not the shared one', async () => {

@@ -38,6 +38,7 @@ vi.mock('../dashboard-collector.js', () => ({
   appendEvent: mockAppendEvent,
   compactEvents: vi.fn().mockResolvedValue(undefined),
   dashboardReport: mockDashboardReport,
+  dataHomeKey: vi.fn().mockResolvedValue('key'),
   eventProjectAnchor: vi.fn().mockResolvedValue(undefined),
 }));
 

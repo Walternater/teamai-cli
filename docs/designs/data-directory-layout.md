@@ -348,25 +348,143 @@ is never read, and its pending deltas are not pushed. The dashboard stays an A2
 singleton: `teamai dashboard`, `session save` and the contribute check read
 across scopes; `stats --by-repo` reads only the current scope's events, as the
 rest of `stats` does (#795). Each event instead
-carries `dataHome`, the `getDataHome()` of the scope the hook resolved (#785), and a
-scope's report keeps only its own. An event written before that field existed is
-attributed by its `cwd`, realpath'd, to the project whose root holds it, never to
-the user scope. Inside git an event also carries `projectAnchor`, the repo's
-main checkout, which all of its worktrees share (#809). `stats --by-repo`,
+carries `dataHomeKey`, a hash of the realpath'd `getDataHome()` of the scope the
+hook resolved (#785; a hash, so a Copilot event still stores no path), and a
+scope's report keeps the sessions whose first keyed event is its own, whole: a
+Stop carries the whole transcript's totals, so a session that moved scope (a `cd`
+mid-session) is reported once, where it started. A tool's own session ID is one
+session whatever ends it records: `claude --resume` continues it, in a new
+process, and its Stop carries the whole transcript. A fallback ID (`pid-…`;
+Copilot's is the parent PID) names one run up to its `session_end` or
+`process_exit`, so a later run that reuses it is decided on its own; a second end with nothing
+recorded since the first (the dashboard monitor's `process_exit` after
+`SessionEnd`) belongs to the run it closed. A `session_start` on a fallback ID
+(`pid-…`) whose `monitorPid` differs from its open run's begins a new run even
+though nothing ended that one (a crash with no dashboard running), and that one
+counts as the run closed before it; a tool's own
+ID is not split this way, since Claude fires SessionStart again on resume, in a
+new process, and its Stop carries the whole transcript. The monitor's `process_exit` also
+records `processExitAfter`, the last event it observed, and closes only that
+run: an exit appended after the next run of the same ID began does not end it,
+and one whose run compaction dropped is ignored. A dashboard started before
+that field existed writes none. A dead process records nothing more, so such
+an exit followed by more events of its fallback ID before the next start did
+not end the open run: it belongs to the run closed before it, however late it
+was appended. A tool's own session ID is
+reported and snapshotted under the ID itself, as before, so a session resumed
+after compaction dropped its events still reads what its scope reported. The
+scope that first reports it also appends the ID and its own data home key to
+`~/.teamai/dashboard/session-owners.jsonl` (never a path, #666), and a session
+recorded there is that scope's wherever it is resumed later, whatever the log
+still holds, so another scope never reports its transcript again; the first
+line for an ID wins, and the file grows by one line per such session, like the
+snapshots. An earlier release kept only per-scope snapshots, so the file is
+first written from them: a tool's own ID is the scope's whose snapshots show it
+reported it with the greatest total (prompts, then tokens). They show it when the
+shared snapshots (all three) hold none of it, or the scope is past their total:
+that release copied the shared file into every scope it ran in, so a copy, even
+the only one, shows nothing, and a tie names no owner. When several scopes
+reported it (a session that release split per event), the owner's line also
+carries the credit of their parts, applied once as its baseline: a part whose
+daily entry shows it ended in a Stop holds the transcript's cumulative total, so
+the greatest such part counts once, while a part with no Stop counted its own
+prompts, which add; interruptions, rejections and tokens, from Stops, take the
+greatest, and corrections, counted per prompt, add. Whether a part with no
+Stop came before another's cumulative Stop, which already counts it, is read
+from the session's transcript when it has one (Claude): it keeps every prompt
+in order with the directory it was typed in, so the Stop covers the first
+prompts and only the part's prompts after those add. With no transcript to
+place them they all add, which undercounts once but never sends a prompt again. The scopes read are the
+user scope, every partition, and a project whose data home is in its workspace
+that a session still in the log leads to; each report also records the IDs of
+its own snapshots that have no owner yet and show it reported them (absent from
+the shared snapshot, or past its total there). A session none of these reach
+(a project whose data home is in its workspace, with no event left in the log)
+is found by its transcript: hooks record `transcriptPath` on UserPromptSubmit,
+Stop and SessionEnd (not SessionStart, whose path on a resume from another
+project names a file that never exists; never Copilot's), and a Claude
+transcript keeps its first `cwd` when resumed elsewhere, as a Codex rollout
+keeps its `session_meta` and Copilot's own session log, found by the session ID
+without storing its path, its `session.start` context. So a tool's own session
+with no owner is the scope's that directory resolves to, when that scope's
+snapshots already hold it; else it is decided as before (a fork under a new ID,
+a tool whose transcript records no start). A session main split across scopes
+per event, whose events are still in the log with each part's `dataHome`, is
+credited once with every part reported: for each scope, the shortest prefix of
+its events whose metrics reach its snapshot, and the owner's entry is raised,
+counter by counter, to at least the metrics of their union (a part may have
+reported more time, tokens or costs with no more prompts), so parts counted before
+any Stop carried the transcript's total are neither lost nor sent twice.
+A Codex session (any Codex variant: `codex`, `codex-internal`, `tcodex`) is kept
+per rollout, with or without a token record, and when
+its tokens come from a thread-level counter that already spans rollouts (then
+no rollout holds tokens of its own, nor does the prior rollout an entry from
+before leaves); a rollout's prompts are its Stop's count or
+else its submits. A
+rollout's counters restart, and compaction drops its events, so its prompt-token
+entry holds each rollout's reported prompts, tokens, interruptions, rejections,
+corrections, active time and request costs under a hash of the rollout's path,
+written with any delta, and whether it failed (an error, an interruption or a
+correction). The session's daily request costs sum its rollouts in the log. A
+rollout compaction has dropped keeps those totals in the session's prompt-token,
+intervention and daily sums (cache tokens from its tokens), and a failed one
+keeps the session unsuccessful, so a later rollout is reported in full and does
+not turn it into a success. An entry
+written before rollouts were kept is one total: an earlier release rewrote every
+session in the log on each report, so it covers the rollouts begun by the time
+its file was last written, or, earlier, when that report wrote the team stats
+file in this scope's reports checkout (after reading the log, before its push;
+the snapshot came after the push). That is read before this report writes
+anything; a seed keeps the
+shared file's time, and `teamai stats`, which only reads, writes no seed). Those still in
+the log consume it in order, as far as each had got by that time, what is left is the dropped rollouts', kept as one
+prior rollout, and a rollout begun later is new.
+Compaction also keeps a session whose tool process is still running, so a run
+an exit from a dashboard before `processExitAfter` marked stopped keeps its
+start, and its ID. A
+fallback run is reported and snapshotted as `<id>@<first event's timestamp>`,
+which does not change when compaction drops earlier runs. A snapshot entry keyed
+by a bare fallback ID (written before) is the sum of the runs of that ID in the
+log at the earlier release's last report, and compaction keeps or drops the
+runs of an ID together. So the next time the scope reports, those runs consume
+the entry in log order, each taking up to its own totals of what is left; once
+the prompt-token entry is used up, the later runs were not reported and count
+as new sessions (the interventions and daily snapshots follow the prompt-token
+one, since their counts say nothing when they run out). A run keeps its own
+success and correction flags, since the sum's are no single run's, so an
+adopted run changes no status total. The first run always
+takes a share, as the entry means that release reported it. The entry is then
+removed, so no later run of that ID reads it. Only an earlier release wrote bare
+entries, and a seeded one may be another scope's, so a run whose first event
+carries `dataHomeKey` (recorded by this release), and every later run of its ID,
+takes none. A session written before that field existed is attributed by its first
+`cwd`: to the scope `resolveConfigForDir` resolves that directory to now, the
+dispatcher's rule, so a nested clone under a project is not the project's; no
+`cwd`, or one removed since, is no scope's. Inside git an event also carries `projectAnchor`, the repo's
+main checkout, which all of its worktrees share (#809); a Copilot event, with no
+`cwd`, carries none. `stats --by-repo`,
 `session save` and the dashboard's Repository filter key a session by the last
 anchor it recorded, else by its `cwd`, and the dashboard gives an event to the
 project rooted at its anchor, so a worktree counts as its repo, also after it
-is removed. The snapshots of what was already reported are per scope too
-(#786), because a session can record events in two scopes (a `cd` mid-session):
+is removed. The snapshots of what was already reported are per scope
+too (#786), because a session ID can recur in another scope (Copilot's fallback
+ID is the parent PID):
 `<dataHome>/dashboard/reported-*.json`, and `~/.teamai/dashboard/user-reported-*.json`
-for the user scope. The first time a scope needs one it copies the shared
+for the user scope. The first time a scope needs one it seeds it from the shared
 `~/.teamai/dashboard/reported-*.json`, so nothing reported before the upgrade is
-sent again; after that it reads only its own. The shared file is no longer
+sent again; after that it reads only its own. That file summed every scope's
+runs of an ID, so the runs of the whole log consume it in log order, whichever
+scope each belongs to, and the seed keeps the shares of the scope's own runs,
+under their run IDs; none goes to a run recorded
+with a `dataHome` path: that release already kept per-scope snapshots, so a
+shared entry under its ID is another scope's. An unmatched fallback entry is
+dropped, so a later reuse of the PID cannot inherit it; a tool's own session ID
+is copied whole, as before, so a session resumed after compaction dropped its
+events is not sent again. The shared file is no longer
 written, except by an earlier release after a rollback, so every scope seeds from
 what the machine had reported by then, never from another scope's later report.
-The seed holds a session's whole total, so a session still running at the upgrade
-that later records in a second scope reports nothing there until that scope's
-part exceeds it.
+The seed holds a session's whole total, so a session still running at the
+upgrade goes on from the reported total, as before.
 
 **`anchor` on save.** Previously only migration wrote a partition's `anchor`
 reverse-lookup file, so freshly-init'd partitions had none. `saveLocalConfigForScope`

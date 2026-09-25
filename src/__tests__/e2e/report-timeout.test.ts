@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
+import { dataHomeKey } from '../../dashboard-collector.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const cli = path.join(root, 'dist/index.js');
@@ -42,15 +43,15 @@ function fixture(agent: keyof typeof agents, provider: string, team: Record<stri
   const timestamp = new Date().toISOString();
   const usageLine = JSON.stringify({ skill: 'review', tool: agent, timestamp }) + '\n';
   // A session the user scope recorded (#785).
-  const dataHome = path.join(home, '.teamai');
-  function seedEvents() {
+  async function seedEvents() {
+    const key = await dataHomeKey(path.join(home, '.teamai'));
     fs.mkdirSync(dashboard, { recursive: true });
     fs.writeFileSync(usage, usageLine);
     fs.writeFileSync(path.join(dashboard, 'events.jsonl'), [
-      { type: 'session_start', timestamp, sessionId: 's1', tool: agent, cwd: sandbox, dataHome },
-      { type: 'prompt_submit', timestamp, sessionId: 's1', tool: agent, promptSummary: 'review', dataHome },
+      { type: 'session_start', timestamp, sessionId: 's1', tool: agent, cwd: sandbox, dataHomeKey: key },
+      { type: 'prompt_submit', timestamp, sessionId: 's1', tool: agent, promptSummary: 'review', dataHomeKey: key },
       { type: 'stop', timestamp, sessionId: 's1', tool: agent, interventions: { interrupt: 1, toolReject: 0 },
-        tokens: { input: 10, output: 5, cacheRead: 0, cacheCreation: 0 }, dataHome },
+        tokens: { input: 10, output: 5, cacheRead: 0, cacheCreation: 0 }, dataHomeKey: key },
     ].map((e) => JSON.stringify(e)).join('\n') + '\n');
   }
   function receiver(mode: 'slow' | 'reject' | 'normal') {
@@ -91,10 +92,12 @@ function fixture(agent: keyof typeof agents, provider: string, team: Record<stri
     const p = path.join(dashboard, `user-reported-${name}.json`);
     return fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : {};
   }
+  // The seeded session's snapshot key: a tool's own session ID keys its one run (#785).
+  const runId = 's1';
   function run(args: string[]) {
     return execFileSync(process.execPath, [cli, ...args], { cwd: sandbox, env, encoding: 'utf8', windowsHide: true });
   }
-  return { home, env, clone, usage, usageLine, dashboard, seedEvents, receiver, pull, stats, snapshot, run };
+  return { home, env, clone, usage, usageLine, dashboard, seedEvents, receiver, pull, stats, snapshot, run, runId };
 }
 
 afterEach(() => {
@@ -109,11 +112,11 @@ describe('real CLI report completion', () => {
       it(`acknowledges slow pushes once: ${provider}/${agent}`, async () => {
         const f = fixture(agent, provider);
         await f.pull(); // Warm reports worktree without any session data.
-        f.seedEvents();
+        await f.seedEvents();
         f.receiver('slow');
         const output = await f.pull(() => {
           expect(fs.readFileSync(f.usage, 'utf8')).toBe(f.usageLine);
-          expect(f.snapshot('prompt-tokens').s1).toBeUndefined();
+          expect(f.snapshot('prompt-tokens')[f.runId]).toBeUndefined();
           expect(fs.existsSync(path.join(f.home, '.teamai/.sync-lock'))).toBe(true);
           // An event arriving during the push must survive cleanup of the batch.
           fs.appendFileSync(f.usage, f.usageLine);
@@ -122,7 +125,7 @@ describe('real CLI report completion', () => {
         expect(f.stats().skills.review.count).toBe(1);
         expect(fs.readFileSync(f.usage, 'utf8')).toBe(f.usageLine);
         for (const name of ['interventions', 'prompt-tokens', 'daily-sessions']) {
-          expect(f.snapshot(name).s1).toBeDefined();
+          expect(f.snapshot(name)[f.runId]).toBeDefined();
         }
         expect(fs.existsSync(path.join(f.home, '.teamai/.sync-lock'))).toBe(false);
         f.receiver('normal');
@@ -142,11 +145,11 @@ describe('real CLI report completion', () => {
   it('retains a rejected report and retries its committed tree without counting twice', async () => {
     const f = fixture('codex', 'git');
     await f.pull();
-    f.seedEvents();
+    await f.seedEvents();
     f.receiver('reject');
     await f.pull();
     expect(fs.readFileSync(f.usage, 'utf8')).toBe(f.usageLine);
-    expect(f.snapshot('prompt-tokens').s1).toBeUndefined();
+    expect(f.snapshot('prompt-tokens')[f.runId]).toBeUndefined();
     f.receiver('normal');
     await f.pull();
     const stats = f.stats();

@@ -1214,6 +1214,19 @@ export interface SessionMetrics {
   prompts: number;
   /** Cumulative token usage across the logical session. */
   tokens: TokenUsage;
+  /**
+   * Each rollout's own totals for a transcript-scoped session (Codex), keyed by
+   * its transcript path: a rollout's counters restart, so the session sums them.
+   * `since` is the rollout's first event.
+   */
+  /** Its tokens come from one counter that spans its rollouts (Codex's thread-level counter). */
+  tokensSpanRollouts?: true;
+  segments?: Record<string, {
+    prompts: number; tokens: TokenUsage; interrupt: number; toolReject: number; correction: number;
+    durationMs: number; requestDaily: Record<string, RequestCostMetrics>; since: string;
+    /** An event of the rollout ended in an error. */
+    error: boolean;
+  }>;
 }
 
 export type DashboardSessionStatus = 'running' | 'waiting_for_input' | 'error' | 'idle' | 'stopped';
@@ -1232,9 +1245,14 @@ export interface DashboardEvent {
   /** Working directory of the session */
   cwd?: string;
   /**
-   * Data home (`getDataHome`) of the scope that recorded the event, the key its
-   * report filters on (#785). Absent on events written before this field
-   * existed; the report then attributes them by `cwd`.
+   * `dataHomeKey()` of the data home of the scope that recorded the event, the
+   * key its report filters on (#785). Absent on events written before this
+   * field existed; the report then attributes them by `cwd`.
+   */
+  dataHomeKey?: string;
+  /**
+   * The data home itself, as a path, which unreleased builds of #795 wrote in
+   * place of `dataHomeKey`. Read only: the report keys it with `dataHomeKey()`.
    */
   dataHome?: string;
   /**
@@ -1262,10 +1280,12 @@ export interface DashboardEvent {
   status?: DashboardSessionStatus;
   /** AI output captured from transcript at session stop (truncated to 500 chars) */
   stoppedOutput?: string;
-  /** Path to Claude Code transcript file (from Stop hook STDIN) */
+  /** The session's transcript (from the Stop, UserPromptSubmit and SessionEnd hook STDIN; never Copilot's) */
   transcriptPath?: string;
   /** Resolved PID of the AI tool main process (for liveness monitoring) */
   monitorPid?: number;
+  /** Last event timestamp the PID monitor observed, so a delayed exit targets that run. */
+  processExitAfter?: string;
   /** Byte boundary captured at Copilot SessionStart; private log path is never stored. */
   copilotRunStartOffset?: number;
   /** Opaque marker metadata retained for events written by older collector versions. */
@@ -1365,8 +1385,8 @@ export interface DashboardSession {
 // getUserHome() (dashboard-collector.ts getEventsPath, dashboard.ts), so HOME
 // isolation already works there. Removed (issue #374 P3). The dashboard is an
 // A2 machine-level singleton keyed by sessionId, not per-project; each event
-// carries the data home of the scope that recorded it, which is what a scope's
-// report filters on.
+// carries the key of the data home of the scope that recorded it, which is what
+// a scope's report filters on.
 export const DASHBOARD_DEFAULT_PORT = 3721;
 /** Sessions with no activity for this long (ms) are marked idle */
 export const DASHBOARD_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
