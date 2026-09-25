@@ -467,6 +467,182 @@ describe('push branch and dirty-clone e2e (issue #663)', () => {
     }
   }, 60_000);
 
+  it('routes config changes to the explicit new branch when an existing PR is also updated', async () => {
+    const fixture = makePushFixture('git', 'https://git.example.test/team/issue-663-mixed.git', 'claude');
+    try {
+      const teamRepo = path.join(fixture.projectRoot, '.teamai', 'team-repo');
+      git(['config', 'core.autocrlf', 'false'], teamRepo);
+      git(['checkout', '--', '.'], teamRepo);
+      const first = await pullModifyAndPush(fixture, 'claude');
+      expect(first.output).toContain('Pushed branch teamai/push/issue-331-git/');
+      const existingBranch = git(
+        ['for-each-ref', '--format=%(refname:short)', 'refs/heads/teamai/push/issue-331-git/'],
+        fixture.remote,
+      );
+      expect(existingBranch).toMatch(/^teamai\/push\/issue-331-git\//);
+
+      const statePath = path.join(fixture.projectRoot, '.teamai', 'state.json');
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8')) as {
+        pendingPushes: Array<{ branch: string; prUrl: string | null }>;
+      };
+      const pending = state.pendingPushes.find((entry) => entry.branch === existingBranch);
+      expect(pending).toBeDefined();
+      if (!pending) return;
+      pending.prUrl = 'https://github.com/team/issue-663-mixed/pull/663';
+      fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n');
+
+      fs.writeFileSync(
+        path.join(fixture.projectRoot, '.claude', 'skills', 'beta-proof', 'SKILL.md'),
+        '---\nname: beta-proof\ndescription: modified again\n---\n\n# Modified again\n',
+      );
+      const newSkillDir = path.join(fixture.projectRoot, '.claude', 'skills', 'gamma-proof');
+      fs.mkdirSync(newSkillDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(newSkillDir, 'SKILL.md'),
+        '---\nname: gamma-proof\ndescription: new\n---\n\n# New skill\n',
+      );
+      fs.appendFileSync(path.join(teamRepo, 'teamai.yaml'), '\npublicSkills: []\n');
+
+      const second = await runCLI(
+        ['push', '--all', '--branch', 'feature/explicit-mixed'],
+        fixture.projectRoot,
+        fixture.home,
+      );
+      expect(second.code, second.output).not.toBe(0);
+      expect(second.output)
+        .toContain('Existing PR updated: https://github.com/team/issue-663-mixed/pull/663');
+      expect(second.output).toContain('Pushed branch feature/explicit-mixed');
+      expect(git(['show', `${existingBranch}:teamai.yaml`], fixture.remote))
+        .not.toContain('publicSkills: []');
+      expect(git(['show', 'feature/explicit-mixed:teamai.yaml'], fixture.remote))
+        .toContain('publicSkills: []');
+      expect(git(['show', 'feature/explicit-mixed:skills/backend/gamma-proof/SKILL.md'], fixture.remote))
+        .toContain('# New skill');
+    } finally {
+      fs.rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('preserves config after a metadata-only existing-PR group before the explicit new branch', async () => {
+    const fixture = makePushFixture('git', 'https://git.example.test/team/issue-800-metadata.git', 'claude');
+    try {
+      const seed = path.join(fixture.sandbox, 'seed');
+      fs.mkdirSync(path.join(seed, 'rules', 'backend'), { recursive: true });
+      fs.writeFileSync(
+        path.join(seed, 'rules', 'backend', 'beta-rule.md'),
+        '---\ntitle: beta-rule\n---\n\n# Original rule\n',
+      );
+      const seedConfigPath = path.join(seed, 'teamai.yaml');
+      fs.writeFileSync(
+        seedConfigPath,
+        fs.readFileSync(seedConfigPath, 'utf8').replace(
+          '    skills: .claude/skills',
+          '    skills: .claude/skills\n    rules: .claude/rules',
+        ),
+      );
+      git(['add', 'teamai.yaml', 'rules/backend/beta-rule.md'], seed);
+      git(['commit', '-q', '-m', 'add rule fixture'], seed);
+      git(['push', '-q', fixture.remote, 'main'], seed);
+
+      const pulled = await runCLI(['pull'], fixture.projectRoot, fixture.home);
+      expect(pulled.code, pulled.output).toBe(0);
+      const rulePath = path.join(fixture.projectRoot, '.claude', 'rules', 'backend', 'beta-rule.md');
+      expect(fs.existsSync(rulePath)).toBe(true);
+      fs.writeFileSync(rulePath, '---\ntitle: beta-rule\n---\n\n# Modified rule\n');
+
+      const first = await runCLI(['push', '--all'], fixture.projectRoot, fixture.home);
+      expect(first.code, first.output).not.toBe(0);
+      expect(first.output).toContain('Pushed branch teamai/push/issue-331-git/');
+      const existingBranch = git(
+        ['for-each-ref', '--format=%(refname:short)', 'refs/heads/teamai/push/issue-331-git/'],
+        fixture.remote,
+      );
+      expect(existingBranch).toMatch(/^teamai\/push\/issue-331-git\//);
+
+      const statePath = path.join(fixture.projectRoot, '.teamai', 'state.json');
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8')) as {
+        pendingPushes: Array<{ branch: string; prUrl: string | null }>;
+      };
+      const pending = state.pendingPushes.find((entry) => entry.branch === existingBranch);
+      expect(pending).toBeDefined();
+      if (!pending) return;
+      pending.prUrl = 'https://github.com/team/issue-800-metadata/pull/800';
+      fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n');
+
+      fs.writeFileSync(
+        rulePath,
+        '---\ntitle: beta-rule\nlastUpdated: 2026-09-24T00:00:00.000Z\n---\n\n# Original rule\n',
+      );
+      const newSkillDir = path.join(fixture.projectRoot, '.claude', 'skills', 'gamma-proof');
+      fs.mkdirSync(newSkillDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(newSkillDir, 'SKILL.md'),
+        '---\nname: gamma-proof\ndescription: new\n---\n\n# New skill\n',
+      );
+      fs.appendFileSync(path.join(fixture.projectRoot, '.teamai', 'team-repo', 'teamai.yaml'), '\npublicSkills: []\n');
+
+      const second = await runCLI(
+        ['push', '--all', '--branch', 'feature/explicit-metadata'],
+        fixture.projectRoot,
+        fixture.home,
+      );
+      expect(second.code, second.output).not.toBe(0);
+      expect(second.output).toContain('Pushed branch feature/explicit-metadata');
+      expect(git(['show', 'feature/explicit-metadata:teamai.yaml'], fixture.remote))
+        .toContain('publicSkills: []');
+      expect(git(['show', `${existingBranch}:teamai.yaml`], fixture.remote))
+        .not.toContain('publicSkills: []');
+    } finally {
+      fs.rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('keeps config off an existing PR when --branch has no new resource group', async () => {
+    const fixture = makePushFixture('git', 'https://git.example.test/team/issue-800-config-only.git', 'claude');
+    try {
+      const first = await pullModifyAndPush(fixture, 'claude');
+      expect(first.output).toContain('Pushed branch teamai/push/issue-331-git/');
+      const existingBranch = git(
+        ['for-each-ref', '--format=%(refname:short)', 'refs/heads/teamai/push/issue-331-git/'],
+        fixture.remote,
+      );
+      expect(existingBranch).toMatch(/^teamai\/push\/issue-331-git\//);
+
+      const statePath = path.join(fixture.projectRoot, '.teamai', 'state.json');
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8')) as {
+        pendingPushes: Array<{ branch: string; prUrl: string | null }>;
+      };
+      const pending = state.pendingPushes.find((entry) => entry.branch === existingBranch);
+      expect(pending).toBeDefined();
+      if (!pending) return;
+      pending.prUrl = 'https://github.com/team/issue-800-config-only/pull/800';
+      fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n');
+
+      fs.writeFileSync(
+        path.join(fixture.projectRoot, '.claude', 'skills', 'beta-proof', 'SKILL.md'),
+        '---\nname: beta-proof\ndescription: modified again\n---\n\n# Modified again\n',
+      );
+      const teamRepo = path.join(fixture.projectRoot, '.teamai', 'team-repo');
+      fs.appendFileSync(path.join(teamRepo, 'teamai.yaml'), '\npublicSkills: []\n');
+
+      const second = await runCLI(
+        ['push', '--all', '--branch', 'feature/explicit-config-only'],
+        fixture.projectRoot,
+        fixture.home,
+      );
+      expect(second.code, second.output).not.toBe(0);
+      expect(second.output)
+        .toContain('Existing PR updated: https://github.com/team/issue-800-config-only/pull/800');
+      expect(second.output).toContain('Pushed branch feature/explicit-config-only');
+      expect(git(['show', `${existingBranch}:teamai.yaml`], fixture.remote))
+        .not.toContain('publicSkills: []');
+      expect(git(['show', 'feature/explicit-config-only:teamai.yaml'], fixture.remote))
+        .toContain('publicSkills: []');
+    } finally {
+      fs.rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   it('refuses a mode-only teamai.yaml change before reset --hard', async () => {
     const fixture = makePushFixture('git', 'https://git.example.test/team/issue-663-dirty.git', 'claude');
     try {
@@ -475,6 +651,32 @@ describe('push branch and dirty-clone e2e (issue #663)', () => {
       git(['checkout', '--', 'teamai.yaml'], teamRepo);
       const pulled = await runCLI(['pull'], fixture.projectRoot, fixture.home);
       expect(pulled.code, pulled.output).toBe(0);
+      git(['config', 'core.fileMode', 'true'], teamRepo);
+      git(['update-index', '--chmod=+x', 'teamai.yaml'], teamRepo);
+      expect(git(['status', '--short'], teamRepo)).toContain('teamai.yaml');
+
+      const result = await runCLI(['push', '--all'], fixture.projectRoot, fixture.home);
+      expect(result.code, result.output).not.toBe(0);
+      expect(result.output).toContain('Cannot push: the team repo has uncommitted changes');
+      expect(result.output).toContain('teamai.yaml');
+      expect(git(
+        ['for-each-ref', '--format=%(refname:short)', 'refs/heads/teamai/push/'],
+        fixture.remote,
+      )).toBe('');
+    } finally {
+      fs.rmSync(fixture.sandbox, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('refuses a content-and-mode teamai.yaml change before reset --hard', async () => {
+    const fixture = makePushFixture('git', 'https://git.example.test/team/issue-663-dirty-content.git', 'claude');
+    try {
+      const teamRepo = path.join(fixture.projectRoot, '.teamai', 'team-repo');
+      git(['config', 'core.autocrlf', 'false'], teamRepo);
+      git(['checkout', '--', 'teamai.yaml'], teamRepo);
+      const pulled = await runCLI(['pull'], fixture.projectRoot, fixture.home);
+      expect(pulled.code, pulled.output).toBe(0);
+      fs.appendFileSync(path.join(teamRepo, 'teamai.yaml'), '\npublicSkills: []\n');
       git(['config', 'core.fileMode', 'true'], teamRepo);
       git(['update-index', '--chmod=+x', 'teamai.yaml'], teamRepo);
       expect(git(['status', '--short'], teamRepo)).toContain('teamai.yaml');
