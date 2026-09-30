@@ -26,8 +26,10 @@ import {
   buildAgentsDeliveryChecks,
   buildNamespaceNotes,
   buildMcpDeliveryChecks,
+  buildMcpGitExcludeCheck,
   buildEnvDeliveryCheck,
   buildEntryResolutionChecks,
+  buildSecretValuesCheck,
   buildEntryScopeKeyCheck,
   entryNamespaceNotes,
   buildDocsCheck,
@@ -42,6 +44,8 @@ import {
  */
 export type CheckSource = 'local' | 'provider';
 import { hasPiHooks } from './pi-hooks.js';
+import { describeEnvAdvisory, envAdvisories } from './env-advisories.js';
+import { resolveTeamEnv, type TeamEnv } from './env-resolution.js';
 
 export interface Check {
   name: string;
@@ -89,6 +93,8 @@ export interface DoctorContext {
   hookToolPaths: TeamaiConfig['toolPaths'];
   /** Where hooks are actually injected — see `resolveHookScope` (#264). */
   baseDir: string;
+  /** This scope's env, resolved once for every check that reads it (env-resolution.ts); none in HTTP mode. */
+  teamEnv?: TeamEnv;
 }
 
 export interface DoctorOptions extends GlobalOptions {
@@ -111,7 +117,10 @@ export interface DoctorReport {
   checks: CheckResult[];
   /** Present only when the team repo declares packages. Human text, not checks. */
   packages?: { ok: boolean; lines: string[] };
-  /** Advisories that are not checks: namespace overrides, the Codex trust-gate reminder. */
+  /**
+   * Advisories that are not checks: namespace overrides, a team secret with no
+   * value (#875), the Codex trust-gate reminder.
+   */
   notes?: string[];
 }
 
@@ -331,8 +340,9 @@ export async function resolveDoctorContext(): Promise<DoctorContext | null> {
     )
     : {};
   const baseDir = hookScope.baseDir;
+  const teamEnv = localConfig.repo.kind === 'http' ? undefined : await resolveTeamEnv(localConfig);
 
-  return { localConfig, teamConfig, toolPaths, hookToolPaths, baseDir };
+  return { localConfig, teamConfig, toolPaths, hookToolPaths, baseDir, teamEnv };
 }
 
 /**
@@ -458,9 +468,11 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
     ...(stage === 'doctor' ? await buildRulesDeliveryChecks(ctx) : []),
     ...(stage === 'doctor' ? await buildAgentsDeliveryChecks(ctx) : []),
     ...await buildMcpDeliveryChecks(ctx),
+    ...await buildMcpGitExcludeCheck(ctx),
     ...await buildDocsCheck(ctx),
     ...await buildEnvDeliveryCheck(ctx),
     ...await buildEntryResolutionChecks(ctx),
+    ...buildSecretValuesCheck(ctx),
     ...await buildEntryScopeKeyCheck(ctx),
   );
 
@@ -555,6 +567,7 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
   const notes = [
     ...await buildNamespaceNotes(ctx),
     ...await entryNamespaceNotes(ctx),
+    ...(await envAdvisories(localConfig, ctx.teamConfig, ctx.teamEnv)).map(describeEnvAdvisory),
     ...(codexNote ? [codexNote] : []),
   ];
 
