@@ -1018,7 +1018,7 @@ describe('hook-handlers registry', () => {
   describe("votes-judge and the learnings checkout's owner (#808)", () => {
     let root: string;
     beforeEach(() => {
-      root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-judge-808-')));
+      root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-judge-808-')));
     });
     afterEach(() => {
       fs.rmSync(root, { recursive: true, force: true });

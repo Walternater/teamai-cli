@@ -115,7 +115,7 @@ function setupLegacyNamedPartition(root: string): string {
   const project = path.join(root, 'app');
   fs.mkdirSync(project);
   gitInit(project);
-  const partition = path.join(root, 'home', '.teamai', 'projects', legacyProjectSlug(fs.realpathSync(project)));
+  const partition = path.join(root, 'home', '.teamai', 'projects', legacyProjectSlug(fs.realpathSync.native(project)));
   const repoDir = path.join(partition, 'team-repo');
   fs.mkdirSync(path.join(repoDir, 'manifest'), { recursive: true });
   fs.writeFileSync(path.join(repoDir, 'teamai.yaml'), 'team: demo\nrepo: owner/repo\nprovider: github\n');
