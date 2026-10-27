@@ -3352,37 +3352,46 @@ export async function pull(
   if (!options.dryRun && !options.inline && !pendingUsageReport) {
     pendingUsageReport = (async () => {
       try {
-        const { reportUsageToTeam } = await import('./team-push.js');
+        const { reportUsageToTeam, clearReportPending } = await import('./team-push.js');
         const { truncateUsageAfterReport, readUsageEvents, capUsageEvents } = await import('./usage-tracker.js');
         const targets: Array<{ repoPath: string; username: string; opts: { skipTruncate: true; selfConfig: LocalConfig } }> = [];
         // Per-target opt-out (teamai.yaml `usageReport: false`, or the member's
         // `usageReportEnabled: false`): a scope that disables stat commits is
         // dropped from the targets — e.g. teams pulling from a read-only
-        // remote never accumulate unpushable commits.
-        if (reconcileProject && reconcileProject.repo.kind !== 'http'
-          && !await usageReportDisabled(reconcileProject)) {
-          targets.push({
-            repoPath: reconcileProject.repo.localPath,
-            username: reconcileProject.username,
-            opts: {
-              skipTruncate: true,
-              // Non-HTTP repos route stats/votes to the teamai-reports orphan branch.
-              selfConfig: reconcileProject,
-            },
-          });
+        // remote never accumulate unpushable commits. Such a scope never runs
+        // the report again, so drop a pending notice it may carry: otherwise
+        // `status` keeps telling the member to pull, which now does nothing
+        // (#1453). The same holds for HTTP, which has no reports branch.
+        if (reconcileProject) {
+          if (reconcileProject.repo.kind !== 'http' && !await usageReportDisabled(reconcileProject)) {
+            targets.push({
+              repoPath: reconcileProject.repo.localPath,
+              username: reconcileProject.username,
+              opts: {
+                skipTruncate: true,
+                // Non-HTTP repos route stats/votes to the teamai-reports orphan branch.
+                selfConfig: reconcileProject,
+              },
+            });
+          } else {
+            await clearReportPending(reconcileProject);
+          }
         }
-        if (reconcileUser && reconcileUser.repo.kind !== 'http'
-          && !await usageReportDisabled(reconcileUser)) {
-          targets.push({
-            repoPath: reconcileUser.repo.localPath,
-            username: reconcileUser.username,
-            opts: {
-              skipTruncate: true,
-              // Non-HTTP repos route stats/votes to the teamai-reports orphan branch —
-              // never reset/pull the default branch (or, in self mode, the business tree).
-              selfConfig: reconcileUser,
-            },
-          });
+        if (reconcileUser) {
+          if (reconcileUser.repo.kind !== 'http' && !await usageReportDisabled(reconcileUser)) {
+            targets.push({
+              repoPath: reconcileUser.repo.localPath,
+              username: reconcileUser.username,
+              opts: {
+                skipTruncate: true,
+                // Non-HTTP repos route stats/votes to the teamai-reports orphan branch —
+                // never reset/pull the default branch (or, in self mode, the business tree).
+                selfConfig: reconcileUser,
+              },
+            });
+          } else {
+            await clearReportPending(reconcileUser);
+          }
         }
 
         // Credit the sessions whose recall evidence is still pending (a read

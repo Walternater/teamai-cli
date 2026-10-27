@@ -29,7 +29,7 @@ vi.mock('../utils/logger.js', () => ({
 
 import { list, status } from '../status.js';
 import { syncWorkflowDefinitions } from '../workflow/cache.js';
-import type { TeamaiConfig, LocalConfig } from '../types.js';
+import { StateSchema, type TeamaiConfig, type LocalConfig } from '../types.js';
 import { log } from '../utils/logger.js';
 import { resetWarnOnce } from '../utils/warn-once.js';
 
@@ -215,6 +215,23 @@ describe('teamai list / status resource coverage', () => {
     expect(out).toMatch(/agents:\s*1/);
     expect(out).toMatch(/hooks:\s*1/);
     expect(out).toMatch(/mcp:\s*1/);
+  });
+
+  it('status shows an unconfirmed auto-report and drops it after a confirmed one (#1453)', async () => {
+    const { loadStateForScope } = await import('../config.js');
+    vi.mocked(loadStateForScope).mockResolvedValueOnce(StateSchema.parse({
+      pendingReportSince: '2026-10-27T06:00:00.000Z',
+    }));
+
+    await status({});
+    const out = lines.join('\n');
+    expect(out).toContain('pending report: since 2026-10-27T06:00:00.000Z');
+    expect(out).toContain('teamai pull --verbose');
+
+    lines.length = 0;
+    vi.mocked(loadStateForScope).mockResolvedValueOnce(StateSchema.parse({}));
+    await status({});
+    expect(lines.join('\n')).not.toContain('pending report');
   });
 
   it('names an undelivered MCP entry even when another entry makes resolution fail', async () => {
