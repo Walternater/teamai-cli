@@ -39,16 +39,26 @@ const MIN_AGE_DAYS = 14;
  * unmerged and its branch deleted is offered again. Without a checkout, the
  * marker alone keeps it out.
  */
+export interface PromotionCandidatesOptions {
+  namespaces?: readonly string[];
+}
+
 export async function findPromotionCandidates(
   learningsDirs: readonly string[],
   votesDir: string,
-  knowledgeCheckout: string | undefined,
+  knowledgeCheckout?: string | PromotionCandidatesOptions,
+  options?: PromotionCandidatesOptions,
 ): Promise<PromotionCandidate[]> {
+  const checkout = typeof knowledgeCheckout === 'string' ? knowledgeCheckout : undefined;
+  const opts = typeof knowledgeCheckout === 'object' && knowledgeCheckout !== null
+    ? knowledgeCheckout
+    : options;
+  const namespaces = opts?.namespaces;
   const confidenceMap = await computeAllConfidence(votesDir);
   const eligible: Array<Omit<PromotionCandidate, 'suggestedCategory'> & { content: string; promotedTo?: string }> = [];
 
   const perDoc = await aggregatePerDocVotes(votesDir);
-  const files = await listLearningFiles(learningsDirs);
+  const files = await listLearningFiles(learningsDirs, namespaces);
   const now = Date.now();
 
   for (const { file, absPath } of files) {
@@ -94,7 +104,7 @@ export async function findPromotionCandidates(
     });
   }
 
-  const inPlace = await promotionTargetsInPlace(knowledgeCheckout, eligible.flatMap((entry) => entry.promotedTo ?? []));
+  const inPlace = await promotionTargetsInPlace(checkout, eligible.flatMap((entry) => entry.promotedTo ?? []));
   const candidates: PromotionCandidate[] = [];
   for (const { content, promotedTo, ...entry } of eligible) {
     if (promotedTo !== undefined && inPlace.has(promotedTo)) continue;
@@ -178,9 +188,8 @@ Remove anecdotal context. State the constraint as an absolute standard.`,
 Remove personal narrative. Write as objective technical documentation.`,
   };
 
+  const { callTool, isOverrideInvalid } = await import('../tool-launch/call.js');
   try {
-    const { callClaude } = await import('../utils/ai-client.js');
-
     const prompt = `You are a technical knowledge engineer promoting a team learning into formal knowledge.
 
 The following "learning" has been repeatedly validated by the team (high confidence, adopted by multiple members). Transform it into ${categoryGuide[category]}
@@ -192,9 +201,10 @@ ${originalContent}
 
 Output ONLY the transformed markdown content (including YAML frontmatter with title, tags, date set to today). Do NOT include the original learning's confidence or vote-related fields in the frontmatter.`;
 
-    const result = await callClaude(prompt, { timeout: 60_000 });
-    return result.trim();
+    const { text } = await callTool(prompt, { launchedBy: 'recall-promote', timeout: 60_000 });
+    return text.trim();
   } catch (e) {
+    if (isOverrideInvalid(e)) throw e;
     log.warn(`AI content generation failed, using original content: ${(e as Error).message}`);
     return originalContent;
   }
@@ -217,9 +227,10 @@ export async function executePromotion(
   if (!['skills', 'rules', 'docs'].includes(category)) {
     throw new Error(`Invalid promotion category "${category}". Use skills, rules, or docs.`);
   }
+  const normalizedFilename = candidate.filename.split(path.sep).join('/');
   const relativePath = category === 'skills'
-    ? path.posix.join(category, candidate.filename.replace(/\.md$/i, ''), 'SKILL.md')
-    : path.posix.join(category, candidate.filename);
+    ? path.posix.join(category, normalizedFilename.replace(/\.md$/i, ''), 'SKILL.md')
+    : path.posix.join(category, normalizedFilename);
   const targetPath = path.join(repoPath, relativePath);
   assertSafePath(targetPath, [repoPath]);
   if (await pathExists(targetPath)) {
@@ -240,7 +251,7 @@ export async function executePromotion(
   let promotedContent = await generatePromotedContent(originalContent, category, candidate.title);
   if (category === 'skills') {
     const { withSkillFrontmatter } = await import('../resources/skills.js');
-    const skillName = path.posix.basename(candidate.filename).replace(/\.md$/i, '');
+    const skillName = path.posix.basename(normalizedFilename).replace(/\.md$/i, '');
     promotedContent = withSkillFrontmatter(promotedContent, skillName);
   }
   await ensureDir(path.dirname(targetPath));
@@ -286,9 +297,8 @@ function inferCategoryByKeywords(content: string, title: string): 'skills' | 'ru
  * Falls back to keyword-based inference if AI is unavailable.
  */
 async function inferCategory(content: string, title: string): Promise<'skills' | 'rules' | 'docs'> {
+  const { callTool, isOverrideInvalid } = await import('../tool-launch/call.js');
   try {
-    const { callClaude } = await import('../utils/ai-client.js');
-
     const prompt = `Classify the following team knowledge entry into exactly ONE category. Reply with ONLY the category name (no explanation):
 
 - "skills" — reusable workflows, SOPs, step-by-step procedures, CLI recipes, operational playbooks
@@ -302,13 +312,14 @@ ${content.slice(0, 2000)}
 
 Category:`;
 
-    const result = await callClaude(prompt, { timeout: 30_000 });
-    const category = result.trim().toLowerCase().replace(/[^a-z]/g, '');
+    const { text } = await callTool(prompt, { launchedBy: 'recall-promote', timeout: 30_000 });
+    const category = text.trim().toLowerCase().replace(/[^a-z]/g, '');
 
     if (category === 'skills' || category === 'rules' || category === 'docs') {
       return category;
     }
-  } catch {
+  } catch (e) {
+    if (isOverrideInvalid(e)) throw e;
     // AI unavailable — fall back to keywords
   }
 

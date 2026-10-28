@@ -28,7 +28,7 @@ import {
   deliveredDocFiles, describeLinkedDocsRoot, isLinkedDocsRoot, isTeamDocsDirectory, keepDocsSearchWhitelist, listStaleDocDirectories, membersDocs,
   resolveDesiredDocs, resolveDocsDestination,
 } from './resources/docs.js';
-import { isToolInstalledForConfig, ResourceHandler } from './resources/base.js';
+import { ResourceHandler } from './resources/base.js';
 import { CODEX_TOOL, mayDeleteSkillCopy, skillOrigin } from './resources/skills.js';
 import { installOf, locate, ownOf, SHARED_AGENT_SKILLS_PATH, writable, writesOf } from './locate.js';
 import { describeToolHomeChange, recordToolHomes } from './tool-home-record.js';
@@ -51,9 +51,10 @@ import {
   TEAMAI_RECALL_RULES_START,
   TEAMAI_RECALL_RULES_END,
   CultureFrontmatterSchema,
-  resolveToolBaseDir,
+  resolveBaseDir,
   resolveHookScope,
   getDataHome,
+  getTeamaiHomeDir,
   getProjectSearchIndexPath,
   isRecallEnabled,
   isUsageReportEnabled,
@@ -421,7 +422,7 @@ async function sweepSharedSkillCopies(
   ledger: DeliveryLedger | undefined,
   scopeLabel: string,
 ): Promise<string[]> {
-  const sharedDir = path.join(resolveToolBaseDir(CODEX_TOOL, localConfig), SHARED_AGENT_SKILLS_PATH);
+  const sharedDir = path.join(resolveBaseDir(localConfig), SHARED_AGENT_SKILLS_PATH);
   const removed: string[] = [];
   for (const name of await listDirs(sharedDir)) {
     if (BUILTIN_SKILL_NAMES.has(name) || !swept(name)) continue;
@@ -659,9 +660,8 @@ async function cleanupTombstonedResources(
         if (rulesDir === undefined) continue;
         typeDir = rulesDir.path;
       } else {
-        if (!await isToolInstalledForConfig(tool, dir, localConfig)) continue;
-        if (isAgentExcluded(localConfig, tool)) continue;
-        typeDir = path.join(resolveToolBaseDir(tool, localConfig), dir);
+        const unhandled: never = type;
+        return unhandled;
       }
       // OMP's copy of a namespaced rule is flat (#946). A file of that name
       // may be the member's own, so only its record makes it teamai's.
@@ -2781,7 +2781,7 @@ async function syncManagedInstructions(
       && Object.values(blocks).some(Boolean) && !await opencodeDeliversThroughPlugin(config, localConfig)) {
       const { opencodeContextReference, readOpencodeInstructionList } = await import('./resources/opencode-config.js');
       const target = targets.find((target) => target.tools.includes('opencode'))!;
-      const { config: file, entry } = opencodeContextReference(target.path, localConfig.scope, resolveToolBaseDir('opencode', localConfig));
+      const { config: file, entry } = opencodeContextReference(target.path, localConfig.scope, resolveBaseDir(localConfig));
       opencodeReady = (await readOpencodeInstructionList(file))?.includes(entry) ?? false;
     }
   } catch (e) {
@@ -3080,6 +3080,7 @@ export async function pull(
   const contended = new Set<LocalConfig>();
   const heldLocks = new Map<LocalConfig, string>();
   let usageReport: Promise<void> | undefined;
+  const reportOutcomes = new Map<LocalConfig, { reported: boolean; at: string }>();
   // Team repo whose pull completed, for `scripts.postPull` — run at the very
   // end of pull(). The config is kept so postPull and postDeploy receive the
   // checkout identity, not only the repo path.
@@ -3340,6 +3341,19 @@ export async function pull(
   // strips a trailer once the team drops the policy.
   unwritten.push(...await reconcileCoAuthorAllScopes(reconcileUser, reconcileProject, options, deliveryRecorder));
 
+  // 3.8. Reconcile the team auto-compact threshold into each tool's own config.
+  //      The user scope decides when there is one, also when this pull skipped
+  //      or only inherited it. A contended one is left to the next pull: handing
+  //      the decision to the project would flip the value.
+  const userScope = activeUserConfig ?? inheritedUserConfig;
+  if (userScope) {
+    if (!contended.has(userScope)) await reconcileAutoCompact(userScope, options);
+  } else if (projectMode && !inheritUserScope) {
+    await reconcileAutoCompactPastSkippedUser(reconcileProject, options);
+  } else {
+    await reconcileAutoCompact(reconcileProject, options);
+  }
+
   // 4. Auto-report usage data to all active scopes. Skill usage lives in each
   //    scope's own file (`<dataHome>/usage.jsonl`, the user scope's
   //    `~/.teamai/user-usage.jsonl`), so each target reports and then
@@ -3349,13 +3363,14 @@ export async function pull(
   if (!options.dryRun && !options.inline && !pendingUsageReport) {
     pendingUsageReport = (async () => {
       try {
-        const { reportUsageToTeam } = await import('./team-push.js');
+        const { reportUsage } = await import('./team-push.js');
         const { truncateUsageAfterReport, readUsageEvents, capUsageEvents } = await import('./usage-tracker.js');
         const targets: Array<{ repoPath: string; username: string; opts: { skipTruncate: true; selfConfig: LocalConfig } }> = [];
         // Per-target opt-out (teamai.yaml `usageReport: false`, or the member's
         // `usageReportEnabled: false`): a scope that disables stat commits is
         // dropped from the targets — e.g. teams pulling from a read-only
-        // remote never accumulate unpushable commits.
+        // remote never accumulate unpushable commits. Clear an excluded
+        // scope's old pending notice without consuming its retained data.
         if (reconcileProject && reconcileProject.repo.kind !== 'http'
           && !await usageReportDisabled(reconcileProject)) {
           targets.push({
@@ -3367,6 +3382,8 @@ export async function pull(
               selfConfig: reconcileProject,
             },
           });
+        } else if (reconcileProject) {
+          reportOutcomes.set(reconcileProject, { reported: true, at: new Date().toISOString() });
         }
         if (reconcileUser && reconcileUser.repo.kind !== 'http'
           && !await usageReportDisabled(reconcileUser)) {
@@ -3380,6 +3397,8 @@ export async function pull(
               selfConfig: reconcileUser,
             },
           });
+        } else if (reconcileUser) {
+          reportOutcomes.set(reconcileUser, { reported: true, at: new Date().toISOString() });
         }
 
         // Credit the sessions whose recall evidence is still pending (a read
@@ -3397,11 +3416,14 @@ export async function pull(
         // still truncates, even if pull has already stopped waiting.
         for (const t of targets) {
           const eventCount = (await readUsageEvents(t.opts.selfConfig)).length;
+          let reported = false;
           try {
-            const reported = await reportUsageToTeam(t.repoPath, t.username, t.opts);
+            reported = await reportUsage(t.repoPath, t.username, t.opts) !== 'unreported';
             if (reported && eventCount > 0) await truncateUsageAfterReport(eventCount, t.opts.selfConfig);
           } catch (e) {
             log.error(`Auto-report to ${t.repoPath} skipped: ${(e as Error).message}`);
+          } finally {
+            reportOutcomes.set(t.opts.selfConfig, { reported, at: new Date().toISOString() });
           }
           // Drain queued workflow run records (#1083): a publication that
           // failed at run start/end is retried here, once per pull.
@@ -3534,18 +3556,35 @@ export async function pull(
       }
     }
     if (result) result.completed = syncResult.completed && !syncResult.docsSyncFailed && !syncResult.agentModelsHeld;
-    const releaseSyncLocks = async () => {
+    const finishReportAndReleaseLocks = async () => {
+      // Other pull stages save whole state snapshots. Record report outcomes
+      // after those writers, still under the sync locks, including late pushes.
+      for (const [config, outcome] of reportOutcomes) {
+        try {
+          const state = await loadStateForScope(config);
+          if (outcome.reported) {
+            if (state.autoReportPendingSince === undefined) continue;
+            delete state.autoReportPendingSince;
+          } else {
+            if (state.autoReportPendingSince !== undefined) continue;
+            state.autoReportPendingSince = outcome.at;
+          }
+          await saveStateForScope(state, config);
+        } catch (error) {
+          log.error(`Could not save auto-report status: ${(error as Error).message}`);
+        }
+      }
       for (const lock of heldLocks.values()) await releaseLock(lock);
     };
     // Late reporting still writes the shared clone and local acknowledgement.
     // Keep its partition locks until completion so another CLI cannot re-report
     // the same data while this pull is no longer waiting.
     if (usageReport && usageReport === pendingUsageReport) {
-      lateUsageReport = usageReport.then(releaseSyncLocks, releaseSyncLocks).catch((e) => {
+      lateUsageReport = usageReport.then(finishReportAndReleaseLocks, finishReportAndReleaseLocks).catch((e) => {
         log.error(`Could not release report sync locks: ${(e as Error).message}`);
       });
     } else {
-      await releaseSyncLocks();
+      await finishReportAndReleaseLocks();
     }
   }
 
@@ -4060,6 +4099,64 @@ async function scopeEnv(localConfig: LocalConfig, teamEnvs: Map<LocalConfig, Tea
   const teamEnv = await resolveTeamEnv(localConfig);
   teamEnvs.set(localConfig, teamEnv);
   return teamEnv;
+}
+
+/**
+ * The auto-compact step of a workspace pull that skipped the user scope. The
+ * user scope still decides when it is set up. Its config and clone are read
+ * under its sync lock, held for this step only; while another process holds
+ * it, the step is left to the next pull.
+ */
+async function reconcileAutoCompactPastSkippedUser(projectConfig: LocalConfig | null, options: GlobalOptions): Promise<void> {
+  if (options.dryRun) return;
+  const lock = path.join(getTeamaiHomeDir(), SYNC_LOCK_FILENAME);
+  if (!(await acquireLock(lock))) {
+    log.debug('[autocompact] skipped: another teamai process holds the user scope\'s sync lock; the next pull retries');
+    return;
+  }
+  try {
+    await reconcileAutoCompact((await loadLocalConfigForScope('user')) ?? projectConfig, options);
+  } finally {
+    await releaseLock(lock);
+  }
+}
+
+/**
+ * Apply the auto-compact threshold to every installed tool. The files are all
+ * per-machine (each tool's home), so one scope decides: the user scope when
+ * there is one, else the project's. What teamai wrote is kept in one
+ * machine-wide record, so it stays teamai's when the deciding scope changes and
+ * a member's own value is never overwritten.
+ */
+async function reconcileAutoCompact(localConfig: LocalConfig | null, options: GlobalOptions): Promise<void> {
+  if (options.dryRun || !localConfig) return;
+  try {
+    const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
+    if (!teamConfig) return;
+    const { reconcileAutoCompactLocked } = await import('./autocompact-reconcile.js');
+    const changes = await reconcileAutoCompactLocked(teamConfig, localConfig);
+    if (!changes) {
+      log.debug('[autocompact] skipped: another teamai process holds the record lock; the next pull retries');
+      return;
+    }
+    for (const c of changes) {
+      if (c.action === 'skipped') log.debug(`[autocompact] ${c.tool}: skipped — ${c.reason}`);
+    }
+    if (options.silent) return;
+    const updated = changes.filter((c) => c.action === 'updated');
+    if (updated.length > 0) {
+      log.info(`Auto-compact threshold applied to ${[...new Set(updated.map((c) => c.tool))].join(', ')}. Restart your AI tool to apply.`);
+    }
+    const removed = changes.filter((c) => c.action === 'removed');
+    if (removed.length > 0) {
+      log.info(`Removed the auto-compact setting teamai wrote for ${[...new Set(removed.map((c) => c.tool))].join(', ')}.`);
+    }
+    for (const c of changes.filter((change) => change.notable)) {
+      log.warn(`Auto-compact threshold not applied to ${c.tool}: ${c.reason}`);
+    }
+  } catch (e) {
+    log.debug(`[autocompact] reconcile failed: ${(e as Error).message}`);
+  }
 }
 
 /**

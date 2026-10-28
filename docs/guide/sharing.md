@@ -71,7 +71,7 @@ teamai push --role frontend
 teamai remove agents code-reviewer
 ```
 
-`pull` writes each tool's own format into that tool's agents directory: `<name>.toml` for the Codex family, `<name>.agent.md` for Copilot, `<name>.json` for Kiro, and `<name>.md` for the rest.
+`pull` writes each tool's own format into that tool's agents directory: `<name>.toml` for the Codex family, `<name>.agent.md` for Copilot, `<name>.json` for Kiro, and `<name>.md` for the rest. Trae and Trae CN load `.trae/agents` only while the Beta setting "Enable Subagents Directory" is on, and accept only their own model ids, so their copy leaves out the agent's `model`. Trae CN's user copy in `~/.trae-cn/agents` takes one an alias or `tool_extras.trae-cn` gives it. A project's `.trae/agents` is read by both editions, so it never gets a `model`, and it takes the other keys of both `tool_extras.trae` and `tool_extras.trae-cn`; an agent whose two editions give one key different values is skipped there, with a warning naming the key. `push` refuses an edit to that file that changes or removes a key the other edition gives.
 
 In single-repo mode, your root copy of an agent placed in a namespace is pushed to the placed file. Changing it from `.md` to `.yaml` retires the original file, even while your checkout is behind its own merged PR. Either way, TeamAI compares the placed file with the blob your last merged push delivered there. If the team edited it since, the push stops and prints a `teamai push --carried <path>@<blob>` command. Carry that edit into your root copy, then run it. The option accepts only that version, so a plain retry or a later team edit stops the push again. An agent deleted by the team is not re-added from your root copy. An older placement record without a blob catches a team edit only while your checkout is behind it, until your first edit through it merges and records its blob.
 
@@ -245,6 +245,8 @@ teamai mcp inject
 teamai mcp remove
 ```
 
+`mcp inject` and `mcp remove` exit with code 1 when a tool's config cannot be read or parsed, including with `--dry-run`. Other tools may still be updated; the command lists those changes and reports that the operation is incomplete. Fix the config named in the warning, then rerun the command. The unreadable config and its ownership records are kept for the retry.
+
 Muse reordering JSON object keys does not make a managed server a personal edit. Removal compares its recorded content, including nested objects, while preserving real command, argument or environment changes. Older records without that content fingerprint need a matching original definition in team Git history; if that proof is unavailable, removal keeps the server and warns.
 
 ## Models
@@ -290,6 +292,35 @@ packages:
 ```
 
 After pull, run `teamai packages`.
+
+## Sessions
+
+Unattended runs now publish their sessions by default. In CI, on a cloud VM or in a hosted job, [`teamai score --drain`](scorers.md#drain-before-an-unattended-job-ends) archives the sessions this machine captured as unattended, and the step sessions of the workflow runs driven here, scrubbed, on `teamai-reports`. The local driver runs it at the end of an unattended run. To keep the old behavior, set `unattended: off`:
+
+```yaml
+# teamai.yaml
+sessions: { publish: { unattended: off } }
+```
+
+`sessions.publish` takes `off`, `ask` or `auto` for each run mode. These are the defaults, written out:
+
+```yaml
+# teamai.yaml
+sessions:
+  publish: { attended: ask, unattended: auto }
+```
+
+`ask` acts as `off` for now, so a person's sessions are archived only by a command such as `teamai session push`. Attended `auto` archives a session once nothing has happened in it for six hours, in the background pass that judges finished sessions. Publishing always scrubs. An HTTP team keeps no session archive, so there `sessions.publish` acts as `off`, and `teamai doctor` says so.
+
+A member's `config.yaml` wins, one mode at a time. A mode it does not name falls through to `teamai.yaml`:
+
+```yaml
+# config.yaml
+sessions:
+  publish: { attended: ask }   # attended only; unattended still follows the team
+```
+
+`teamai doctor` reports a value that is not `off`, `ask` or `auto`, with its file and key, and teamai ignores it, so that mode falls to the next level. `teamai review --branch` fails a branch whose `teamai.yaml` has such a value. [Finished sessions](scorers.md#finished-sessions) covers `sessions` in `scorers/scoring.yaml`, which decides whether sessions are judged.
 
 ## Docs
 

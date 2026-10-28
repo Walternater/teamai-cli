@@ -341,7 +341,7 @@ where 5.7 reads hooks, so it writes none, and `teamai doctor` names them under
 
 ### Muse Code
 
-Hooks go in the `hooks` block of `~/.config/muse/settings.json`, which Muse runs in every workspace; a project's `.muse/hooks.json` runs only once the workspace is trusted. Muse starts each hook with an emptied environment, so a variable set only on the command that launched `muse` (such as `TEAMAI_HOOKS_DISABLED=1 muse`) does not reach the hook. The hook command runs `bash -lc`, so export it in `~/.bash_profile` or `~/.profile` instead.
+Hooks go in the `hooks` block of `~/.config/muse/settings.json` (`$XDG_CONFIG_HOME/muse/settings.json` when that is set), which Muse runs in every workspace; a project's `.muse/hooks.json` runs only once the workspace is trusted. Muse starts each hook with an emptied environment, so a variable set only on the command that launched `muse` (such as `TEAMAI_HOOKS_DISABLED=1 muse`) does not reach the hook. The hook command runs `bash -lc`, so export it in `~/.bash_profile` or `~/.profile` instead.
 
 ### Tools without a writable hook surface
 
@@ -399,6 +399,10 @@ built-in and enterprise plugins support both OpenCode 1.18.23 (`server`) and V2
 
 - Re-run the failing command with `-v` / `--verbose` for detail.
 - `teamai status` shows exactly how local differs from the team repo.
+- If status shows `auto-report: pending since <time>`, report data is still
+  local after an unconfirmed push. Run `teamai pull --verbose` to retry and
+  see the cause. A successful report, or a pull after reporting is disabled,
+  clears the notice. Disabling reporting keeps the local data.
 - Report unexpected behavior at https://github.com/Tencent/teamai-cli/issues
   with the agent name, platform, and the step that failed.
 
@@ -425,7 +429,10 @@ An HTTP prompt sync that cannot clean retired blocks reports a failed ACK and
 keeps its previous cache and manifest for the server's retry.
 OpenClaw HTTP prompts require an existing resolved user workspace, but not an
 existing `AGENTS.md`: the prompt sync creates that file and preserves personal
-text already in it.
+text already in it. When the server sends no workspace and `openclaw.json` is
+not plain JSON, OpenClaw is skipped and the ACK names that reason; the ACK
+fails only when no tool received the prompt. Make the file plain JSON, then
+retry.
 
 OpenCode registration saves ownership before activating a new config entry.
 If the state write fails, repair the state directory's permissions and retry
@@ -448,7 +455,7 @@ Session archive writers (`session push`, `migrate --push`, and `session pull`) w
 
 ## OpenCode hooks cannot start the CLI
 
-If OpenCode hooks stopped after moving or reinstalling Node or TeamAI, run `teamai hooks inject` or `teamai pull` and restart OpenCode. The plugin records the installed Node and CLI paths so it also works without `teamai` on the service PATH. Doctor accepts those live paths when another installation of the same build inspects the plugin; missing saved paths or a changed handler still fail the check.
+If OpenCode hooks stopped after moving or reinstalling Node or TeamAI, run `teamai hooks inject` or `teamai pull` and restart OpenCode. The plugin records the installed Node and CLI paths so it also works without `teamai` on the service PATH. Doctor accepts those live paths when another installation with the same handler inspects the plugin; invalid saved launcher files or a changed handler still fail the check.
 
 ## ZCode registered hooks but missing project rules
 

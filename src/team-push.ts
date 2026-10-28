@@ -8,6 +8,8 @@ import { collectTeamRepoSkills } from './agent-skills.js';
 import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
 import { readEvents, aggregateSessionMetrics, dataHomeKey, memberEvents, sessionRuns } from './dashboard-collector.js';
 import { RUN_MODES, type RunMode, type SessionRun } from './launch-context.js';
+import { addOutcomeStats } from './outcomes.js';
+import { SessionOutcomes, type FoldInput } from './session-outcomes.js';
 import { writeFile, readFileSafe, ensureDir, pathExists, readJson, writeJson } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import type {
@@ -47,7 +49,7 @@ interface PromptTokenDelta {
 //  [pull team resources] ── existing flow ──
 //      │
 //      ▼
-//  [reportUsageToTeam()]
+//  [reportUsage()]
 //      │
 //      ▼
 //  [update teamai-reports branch]
@@ -954,24 +956,25 @@ function changedCounters(existing: UserModeStats | undefined, delta: UsageDelta)
   return changed;
 }
 
+/** What one usage report did: pushed the new counts, found none to push, or did not push them (skipped or failed). */
+export type UsageReportOutcome = 'reported' | 'nothing' | 'unreported';
+
 /**
- * Auto-report usage data to team repo during pull.
+ * Reports this scope's usage data to the team repo.
  * Merges new events with existing stats to preserve historical data.
  * Best-effort: silently fails on any error.
  * Resolves only after push and success bookkeeping settle. The caller may bound
  * its wait, but must keep this operation alive so late success is acknowledged.
- * Returns false when reporting was skipped or failed; true when there is no
- * pending data or the report completed successfully.
  */
-export async function reportUsageToTeam(
+export async function reportUsage(
   repoPath: string,
   username: string,
-  options: { skipTruncate?: boolean; selfConfig: LocalConfig },
-): Promise<boolean> {
+  options: { skipTruncate?: boolean; selfConfig: LocalConfig; drain?: FoldInput['drain'] },
+): Promise<UsageReportOutcome> {
   const reportsConfig = options.selfConfig;
   if (!usesBranchWorktree(reportsConfig)) {
     log.debug(`Skipping report for HTTP repo ${repoPath}`);
-    return false;
+    return 'unreported';
   }
   let restoreStats: (() => Promise<void>) | undefined;
 
@@ -988,7 +991,9 @@ export async function reportUsageToTeam(
     // Fold the local dashboard event log into per-session metrics once, then derive
     // both the intervention delta and the prompt-count/token delta from it.
     // Only the member's own sessions recorded in this scope (#785).
-    const dashboardEvents = memberEvents(await filterEventsByScope(await readEvents(), reportsConfig));
+    const logged = await readEvents();
+    const scopedEvents = await filterEventsByScope(logged, reportsConfig);
+    const dashboardEvents = memberEvents(scopedEvents);
     const metrics = aggregateSessionMetrics(dashboardEvents);
 
     const currentInterventions = interventionCounts(metrics);
@@ -1026,15 +1031,27 @@ export async function reportUsageToTeam(
       ...await reportedBeyondShared(reportedPromptTokens, reportedInterventions, reportedDailySessions),
     ], await dataHomeKey(getDataHome(reportsConfig)));
 
+    // What the scope's finished sessions delivered (#1387), counted once each, with the usage this report counts for them.
+    const outcomeFold = await SessionOutcomes.fold({
+      config: reportsConfig, logged, scoped: scopedEvents, member: dashboardEvents,
+      totals: {
+        promptTokens: { ...reportedPromptTokens, ...nextReportedPromptTokens },
+        interventions: { ...reportedInterventions, ...nextReported },
+      },
+      now: Date.now(),
+      drain: options.drain,
+    });
+
     const hasUsage = events.length > 0;
     const hasInterventions = hasInterventionDelta(interventionDelta);
     const hasPromptTokens = hasPromptTokenDelta(promptTokenDelta);
     const hasDaily = hasDailyDelta(dailyDelta);
+    const hasOutcomes = outcomeFold.finished.length > 0;
 
-    const hasStats = hasUsage || hasInterventions || hasPromptTokens || hasDaily;
+    const hasStats = hasUsage || hasInterventions || hasPromptTokens || hasDaily || hasOutcomes;
     const commitMsg = hasUsage
       ? `[teamai] Update usage stats for ${username}`
-      : (hasInterventions || hasPromptTokens || hasDaily)
+      : (hasInterventions || hasPromptTokens || hasDaily || hasOutcomes)
         ? `[teamai] Update session stats for ${username}`
         : `[teamai] Update votes for ${username}`;
 
@@ -1072,6 +1089,7 @@ export async function reportUsageToTeam(
           const counters = { ...existing?.[mode], ...changedCounters(existing?.[mode], delta) };
           if (Object.keys(counters).length > 0) merged[mode] = counters;
         }
+        if (hasOutcomes) merged.outcomes = addOutcomeStats(existing?.outcomes, outcomeFold.delta);
 
         await writeFile(statsPath, YAML.stringify(merged));
         filesToPush.push(`stats/${username}.yaml`);
@@ -1112,7 +1130,7 @@ export async function reportUsageToTeam(
     }
     if (!hasStats && !hasVotes) {
       log.debug('No usage events or votes to report');
-      return true;
+      return 'nothing';
     }
     const { updateReports } = await import('./utils/reports-branch.js');
     const { isPublished } = await import('./utils/branch-worktree.js');
@@ -1133,7 +1151,7 @@ export async function reportUsageToTeam(
     if (!pushed) {
       log.debug('Auto-report push was not confirmed; keeping local report data');
       await restoreStats?.();
-      return false;
+      return 'unreported';
     }
     restoreStats = undefined;
 
@@ -1162,10 +1180,14 @@ export async function reportUsageToTeam(
       await writeReportedDailySessions({ ...existingDaily, ...nextReportedDailySessions }, reportsConfig);
       log.debug(`Reported daily session trends (${Object.keys(dailyDelta).length} UTC day buckets) to team repo`);
     }
-    if (!hasUsage && !hasInterventions && !hasPromptTokens && !hasDaily) {
+    if (hasOutcomes) {
+      await SessionOutcomes.markReported(reportsConfig, outcomeFold.finished);
+      log.debug(`Reported the outcomes of ${outcomeFold.finished.length} finished sessions to team repo`);
+    }
+    if (!hasUsage && !hasInterventions && !hasPromptTokens && !hasDaily && !hasOutcomes) {
       log.debug('Pushed pending votes to team repo');
     }
-    return true;
+    return 'reported';
   } catch (e) {
     try {
       await restoreStats?.();
@@ -1173,6 +1195,6 @@ export async function reportUsageToTeam(
       log.error(`Could not restore report stats after failure: ${(restoreError as Error).message}`);
     }
     log.error(`Auto-report skipped: ${(e as Error).message}`);
-    return false;
+    return 'unreported';
   }
 }

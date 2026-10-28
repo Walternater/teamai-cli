@@ -71,7 +71,7 @@ teamai push --role frontend
 teamai remove agents code-reviewer
 ```
 
-`pull` 按工具自己的格式写入它的 agents 目录：Codex 系列是 `<name>.toml`，Copilot 是 `<name>.agent.md`，Kiro 是 `<name>.json`，其余是 `<name>.md`。
+`pull` 按工具自己的格式写入它的 agents 目录：Codex 系列是 `<name>.toml`，Copilot 是 `<name>.agent.md`，Kiro 是 `<name>.json`，其余是 `<name>.md`。Trae 和 Trae CN 只在 Beta 设置“启用 Subagents 目录”打开时加载 `.trae/agents`，且只接受自己的模型 id，所以它们的副本不写 agent 的 `model`。Trae CN 在 `~/.trae-cn/agents` 的用户副本会写别名或 `tool_extras.trae-cn` 给出的模型。项目的 `.trae/agents` 两个版本都会读，所以从不写 `model`，其他键则同时取自 `tool_extras.trae` 和 `tool_extras.trae-cn`；两个版本给同一个键不同的值时，该 agent 在那里会被跳过，并给出点名该键的警告。`push` 会拒绝在该文件里修改或删除另一个版本给出的键。
 
 单仓库模式下，已放入命名空间的 agent 的根目录副本会推送到放置后的文件。把它从 `.md` 转为 `.yaml` 会移除原文件，即使当前检出落后于自己已合并的 PR 也是如此。两种情况下，TeamAI 都会把放置后的文件与你上次合并的推送写入的 blob 对比。团队之后又编辑过该文件时，推送会停止并给出 `teamai push --carried <path>@<blob>` 命令。把这次修改带入根目录副本，再运行该命令。该选项只接受这一版本，直接重试或团队之后再次编辑都会再次停止推送。团队已删除的 agent 不会从根目录副本重新添加。没有 blob 的旧放置记录，只有在检出落后于团队修改时才能发现这次修改；你通过它推送的第一次编辑合并后，该记录会补上这次的 blob。
 
@@ -245,6 +245,8 @@ teamai mcp inject
 teamai mcp remove
 ```
 
+`mcp inject` 和 `mcp remove` 遇到无法读取或解析的工具配置时返回退出码 1，`--dry-run` 也一样。其他工具仍可能更新；命令会列出这些变更，并报告操作未完成。修复警告中指出的配置后，重新运行该命令。无法读取的配置及其归属记录会保留，供重试使用。
+
 Muse 调整 JSON 对象的键顺序不会被视为个人修改。移除时会核对记录的内容（包括嵌套对象），仍会保留实际修改过命令、参数或环境变量的 server。旧记录如果没有内容指纹，需要团队 Git 历史中与原 hash 匹配的定义作为依据；无法证明时会保留 server 并提示。
 
 ## 模型
@@ -290,6 +292,35 @@ packages:
 ```
 
 pull 之后跑 `teamai packages`。
+
+## 会话
+
+无人值守的运行现在默认发布自己的会话。在 CI、云虚拟机或托管任务中，[`teamai score --drain`](scorers.md#无人值守任务结束前运行-drain) 会把本机记录为无人值守的已捕获会话，以及在这里驱动的工作流运行的步骤会话，脱敏后归档到 `teamai-reports`。本地驱动在无人值守运行结束时执行它。要保持原来的行为，设置 `unattended: off`：
+
+```yaml
+# teamai.yaml
+sessions: { publish: { unattended: off } }
+```
+
+`sessions.publish` 按运行模式分别取 `off`、`ask` 或 `auto`。下面写出的是默认值：
+
+```yaml
+# teamai.yaml
+sessions:
+  publish: { attended: ask, unattended: auto }
+```
+
+`ask` 目前等同于 `off`，所以成员的会话只会通过 `teamai session push` 等命令归档。有人值守的 `auto` 在会话六小时没有任何活动后归档它，由评判已结束会话的后台任务完成。发布总会脱敏。HTTP 团队没有会话归档，因此在那里 `sessions.publish` 等同于 `off`，`teamai doctor` 会说明这一点。
+
+成员的 `config.yaml` 优先，按模式分别生效。它没有写的模式沿用 `teamai.yaml`：
+
+```yaml
+# config.yaml
+sessions:
+  publish: { attended: ask }   # 只设置有人值守；无人值守仍按团队设置
+```
+
+值不是 `off`、`ask` 或 `auto` 时，`teamai doctor` 会报告它所在的文件和键，teamai 忽略该值，这种模式交给下一级。分支的 `teamai.yaml` 含有这样的值时，`teamai review --branch` 判定失败。会话是否评判由 `scorers/scoring.yaml` 中的 `sessions` 决定，见[已结束的会话](scorers.md#已结束的会话)。
 
 ## Docs（文档）
 

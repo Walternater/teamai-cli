@@ -2,7 +2,7 @@ import YAML from 'yaml';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readWorkspaceChildren } from './workspace-children.js';
-import { saveLocalConfig, loadTeamConfig, saveLocalConfigForScope, loadLocalConfigForScope, loadStateForScope, refreshRoleAssignment, saveStateForScope, resolveProjectDataHome } from './config.js';
+import { hasUserScopeInstall, saveLocalConfig, loadTeamConfig, saveLocalConfigForScope, loadLocalConfigForScope, loadStateForScope, refreshRoleAssignment, saveStateForScope, resolveProjectDataHome } from './config.js';
 import { codexTrustPolicy, deliveredHookFiles, describeUnappliedTeamHooks, hasTeamaiHooks, reconcileHooks, reconcileTeamHooksForConfig, reportCodexTrust, trustCodexForScope } from './hooks.js';
 import { configureGitUser, resolveAnchors, initRepo, isGitRepo, getRemoteUrl, getConfiguredRemoteUrl, remotesMatch, redactGitCredentials, pullRepoFastForward, DetachedTeamRepoError, pushRepoDirectly, autoPushViaMR, gitBlockTimeoutMs, createGitWithBlockTimeout } from './utils/git.js';
 import { withTimeout } from './utils/async.js';
@@ -27,7 +27,7 @@ async function settleModeSwitch(previous: LocalConfig | null, next: LocalConfig,
   const switched = await setAsideQueueOnModeSwitch(previous, next, async () => {
     const ownerChanged = previous
       ? !sameQueueOwner(queueOwner(previous), queueOwner(next))
-      : fs.existsSync(path.join(getDataHome(next), 'config.yaml'));
+      : await holdsInstallFor(next.scope, path.join(getDataHome(next), 'config.yaml'));
     if (ownerChanged) await dropAllSearchIndexes(getDataHome(previous ?? next));
     await save();
   });
@@ -38,6 +38,11 @@ async function settleModeSwitch(previous: LocalConfig | null, next: LocalConfig,
     );
     process.exit(1);
   }
+}
+
+/** Whether `scope`'s config file holds an install. ~/.teamai/config.yaml may hold only the member's own settings. */
+async function holdsInstallFor(scope: Scope, configPath: string): Promise<boolean> {
+  return scope === 'user' ? hasUserScopeInstall() : pathExists(configPath);
 }
 
 /**
@@ -65,13 +70,35 @@ async function moveConfigAside(configPath: string, next: LocalConfig): Promise<v
 async function loadConfigSetAside(configPath: string): Promise<LocalConfig | null> {
   let latest: string | undefined;
   for (let n = 0, aside = `${configPath}.previous`; await pathExists(aside); aside = `${configPath}.previous.${++n}`) latest = aside;
-  if (!latest) return null;
+  return latest ? readConfigFile(latest) : null;
+}
+
+/** The config file at `configPath` as written: nothing a load fills in from another level. Null when it cannot be read. */
+async function readConfigFile(configPath: string): Promise<LocalConfig | null> {
   try {
-    return LocalConfigSchema.parse(YAML.parse(await readFileSafe(latest) ?? ''));
+    return LocalConfigSchema.parse(YAML.parse(await readFileSafe(configPath) ?? ''));
   } catch (e) {
-    log.debug(`Not carrying settings from ${latest}: ${(e as Error).message}`);
+    log.debug(`Not carrying settings from ${configPath}: ${e instanceof Error ? e.message : String(e)}`);
     return null;
   }
+}
+
+/**
+ * The settings of the config file a re-init replaces that it keeps as the file had them (#1458): every key but the ones
+ * init decides on each run, the install, the role and project selection, the agents and the tool roots. The tag
+ * subscription and the skill exclusions name content of the team repo they were chosen from, so they are kept only
+ * when the re-init stays on that repo, `remote`.
+ */
+function settingsReinitKeeps(file: LocalConfig | null, remote: string) {
+  if (!file) return {};
+  const {
+    repo, username: _username, provider: _provider, scope: _scope, projectRoot: _projectRoot,
+    primaryRole: _primaryRole, additionalRoles: _additionalRoles, projects: _projects, resourceProfileVersion: _version,
+    inheritUserScope: _inheritUserScope, enabledAgents: _enabledAgents, disabledAgents: _disabledAgents, toolRoots: _toolRoots,
+    ...settings
+  } = file;
+  const { subscribedTags: _subscribedTags, excludedSkills: _excludedSkills, ...anyTeamSettings } = settings;
+  return remotesMatch(repo.remote, remote) ? settings : anyTeamSettings;
 }
 import { log, spinner } from './utils/logger.js';
 import {
@@ -735,13 +762,14 @@ export async function initHttp(
 
   // Re-init guard
   const existingConfigPath = path.join(teamaiHome, 'config.yaml');
-  if (await pathExists(existingConfigPath) && !options.force) {
+  if (await holdsInstallFor(scope, existingConfigPath) && !options.force) {
     const confirmed = await askConfirmation(`teamai already initialized at ${existingConfigPath}. Overwrite? [y/N] `);
     if (!confirmed) {
       log.info('Aborted. Existing config is unchanged.');
       return;
     }
   }
+  const replacedFile = existingLocalConfig && await readConfigFile(existingConfigPath);
 
   // Step 1: API key. Persist --token when given (one command sets endpoint+key),
   // otherwise fall back to TEAMAI_API_TOKEN / an existing ~/.teamai/apikey.
@@ -772,6 +800,7 @@ export async function initHttp(
 
   // Step 4: save local config (kind: http; only the URL is stored, never the key)
   const localConfig: LocalConfig = {
+    ...settingsReinitKeeps(replacedFile, url),
     repo: { localPath, remote: url, kind: 'http', url },
     username: 'http-consumer',
     scope,
@@ -1225,10 +1254,25 @@ export async function initSelfRepo(options: GlobalOptions & {
   agent?: string | string[];
   force?: boolean;
   inheritUserScope?: boolean;
+  scope?: string;
 }): Promise<void> {
   // No preview yet, so stop before anything (#900).
   if (options.dryRun) {
     log.error(noDryRunPreview('init'));
+    process.exit(1);
+    return;
+  }
+  // Single-repo mode always installs at project scope. Ignoring an explicit
+  // --scope user would hand back a config the member did not ask for, so refuse
+  // before touching the repo (#1454).
+  if (options.scope === 'user') {
+    log.error(
+      '--scope user is not supported in single-repo mode (`teamai init --self` / `teamai init .`): '
+      + 'it installs at workspace scope. Run it again without --scope user. '
+      + 'For a user-scope install of this repo, write ~/.teamai/config.yaml by hand with '
+      + 'scope: user, username: <you>, repo.kind: self, repo.remote: <origin URL>, '
+      + 'repo.localPath: <repo>/.teamai and repo.businessRepoRoot: <repo>.',
+    );
     process.exit(1);
     return;
   }
@@ -1267,6 +1311,7 @@ export async function initSelfRepo(options: GlobalOptions & {
     process.exit(1);
     return;
   }
+  const replacedFile = preInitConfig && await readConfigFile(path.join(getDataHome(preInitConfig), 'config.yaml'));
 
   log.info(`Scope: workspace (${businessRepoRoot})`);
   log.info(`  knowledge → ${localPath}/{skills,rules,docs,learnings} (committed to main)`);
@@ -1388,6 +1433,7 @@ export async function initSelfRepo(options: GlobalOptions & {
   // so config/state and every other class-A1 write lands outside the repo (P2);
   // repo.localPath stays <repo>/.teamai — that is the class-B knowledge anchor.
   const localConfig: LocalConfig = {
+    ...settingsReinitKeeps(replacedFile, repoInfo.httpsUrl),
     repo: { localPath, remote: repoInfo.httpsUrl, kind: 'self', businessRepoRoot },
     username,
     ...(options.provider ? { provider: options.provider } : {}),
@@ -1689,6 +1735,7 @@ export async function init(options: GlobalOptions & {
   // init stopped after moving it aside, the one it set aside (#823 item 17).
   const carriedConfig = existingLocalConfig
     ?? (await pathExists(existingConfigPath) ? null : await loadConfigSetAside(existingConfigPath));
+  const replacedFile = existingLocalConfig ? await readConfigFile(existingConfigPath) : carriedConfig;
   let inheritUserScope: boolean | undefined;
   try {
     inheritUserScope = resolveInheritUserScope(
@@ -1711,7 +1758,7 @@ export async function init(options: GlobalOptions & {
   }
 
   // Step 0.5: Re-init guard — warn if config already exists
-  if (await pathExists(existingConfigPath)) {
+  if (await holdsInstallFor(scope, existingConfigPath)) {
     log.warn(`teamai is already initialized for ${installScopeName(scope)} scope at ${existingConfigPath}`);
     if (options.force) {
       log.info('Overwriting existing config (--force)');
@@ -1804,7 +1851,7 @@ export async function init(options: GlobalOptions & {
     };
     const replacesAnother = existingLocalConfig
       ? !sameQueueOwner(queueOwner(existingLocalConfig), queueOwner(next))
-      : await pathExists(existingConfigPath);
+      : await holdsInstallFor(scope, existingConfigPath);
     if (replacesAnother) await settleModeSwitch(existingLocalConfig, next, () => moveConfigAside(existingConfigPath, next));
     replacedInstallSettled = true;
   };
@@ -2281,6 +2328,7 @@ export async function init(options: GlobalOptions & {
 
   // Step 6: Save local config
   const localConfig: LocalConfig = {
+    ...settingsReinitKeeps(replacedFile, repoInfo.httpsUrl),
     repo: { localPath, remote: repoInfo.httpsUrl },
     username,
     ...(forcedProvider ? { provider: forcedProvider } : {}),

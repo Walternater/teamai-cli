@@ -27,6 +27,8 @@ teamai contribute --file /tmp/session.md --namespace payments
 
 `--namespace` 必须是当前 scope 的项目在 `manifest/projects.yaml` 里、或其角色在 `manifest/roles.yaml` 里声明的 learnings namespace。`--namespace ""` 写入共享根目录 `learnings/`。
 
+[使用统计上报](reporting.md#你的会话产出了什么)把经验计为它来源会话的产出（`--session-id`，否则为智能体当前会话）。teamai 能判断该会话由哪个工具运行时，经验还会在 frontmatter 的 `session` 中记下该会话。
+
 不想要这条提醒时，在 `teamai.yaml` 里写：
 
 ```yaml
@@ -79,7 +81,7 @@ teamai recall disable
 teamai recall status
 ```
 
-本机覆盖写在 `~/.teamai/config.yaml` 的 `recallEnabled`。`TEAMAI_RECALL_DISABLED=1` 强制关掉。关掉之后 pull 不再安装 recall；直接运行 `teamai recall` 仍然可以搜。
+本机覆盖写在 `~/.teamai/config.yaml` 的 `recallEnabled`。`TEAMAI_RECALL_DISABLED=1` 强制关掉，此时 `teamai recall status` 会指出是这个变量关掉的。关掉之后 pull 不再安装 recall；直接运行 `teamai recall` 仍然可以搜。这个变量改的是同一作用域内所有 shell 共用的文件：在设了它的 shell 里 pull，会把整个作用域的 recall 文件和 CLAUDE.md 里的 recall 段删掉；在没设它的 shell 里再 pull，又会装回来。
 
 关闭 recall 不会隐藏 SessionStart 的近期已合入 MR 提示。这条提示指向 `teamai import --from-mr`，团队在开启 recall 前也可以先提炼并发布 learning。它有自己的开关，关闭它不会影响 `contributeHint`：
 
@@ -102,6 +104,8 @@ teamai recall maintenance --update-quality
 ```
 
 `--archive` 收走置信度低于 0.15 的 learning。`--update-quality` 写出 `.draft.md`，改好后把文件名改成 `.md`。
+
+知识摘要与维护命令（`teamai digest`、`teamai recall maintenance` 及 `teamai recall promote`）均涵盖当前作用域内活跃的项目命名空间经验以及共享根目录经验。
 
 置信度是 0 到 1 的活动评分，不是知识正确或任务成功的概率。正反馈计数与召回计数的比值最高按 1 计算，因此重复正反馈不会超出这一项 30% 的权重。近期度取最近一次召回与最近一次正反馈中较晚的时间，因此新的正反馈也会刷新近期度。
 
@@ -150,7 +154,7 @@ GitLab 的 `--from-org`，以及 GitHub `--from-org` 的 `gh` 路径与回退到
 
 AI 生成的 MR learning 中，`title` 不是字符串时，摘要和入队文件名使用 MR 标题；`tags` 只展示数组中的字符串项。不会为了修复元数据而改写草稿正文。
 
-`--incremental` 只重新提取上次导入后改过的文件，基线随每个代码库存在它自己的 `evidence/code/<slug>/` 里。远端仓库的 slug 是 `<provider>__<owner>__<repo>`，`--from-repo`、`--from-mr` 和 `teamai ci extract-mr` 用的都是它；`--dir` 用仓库名。
+`--incremental` 只重新提取上次导入后改过的文件，基线随每个代码库存在它自己的 `evidence/code/<slug>/` 里。远端仓库的 slug 是 `<provider>__<owner>__<repo>`，`--from-repo`、`--from-mr` 和 `teamai ci extract-mr` 用的都是它。checkout 的 `origin` 指向该仓库时，`--dir` 也用它；否则用仓库名或目录名，并且不会覆盖另一个远端仓库、同一仓库的另一个目录、或另一个没有 `origin` 的 checkout 在那里发布的 evidence。没有 `origin` 的 checkout，若同名 slug 已被另一个这样的 checkout 占用，则用 `<name>-<hash8>`；导入时输出的 `project:` 就是实际使用的 slug。
 
 `--max-files` 调整单个仓库采集源码文件的上限（默认 200）。采集按关键文件优先；文件数超出上限时会截断，并输出同时带两个计数的警告，不再静默丢弃。
 
@@ -193,7 +197,7 @@ teamai ci extract-mr --url "$MR_URL" --mode write --team-repo ../team-repo --ind
 
 write 模式在合并后的源码 checkout 里运行，代码知识走和 `teamai import --dir . --incremental` 相同的流程，写进 `<team-repo>/teamwiki/evidence/code/<provider>__<owner>__<repo>/`，只重新提取改过的文件。团队仓库要克隆在 checkout 之外，否则它的文件会被当成源码提取，这一步会被跳过。
 
-不要的建议打上拒绝标记：GitHub 和 GitLab 用 👎，工蜂用 ☝️。模板（GitHub Actions、GitLab CI、智研 / Coding CI）在 [`examples/ci/`](../../../examples/ci/README.md)。
+不要的建议打上拒绝标记：GitHub 和 GitLab 用 👎，工蜂用 ☝️。模板（GitHub Actions、GitLab CI、智研 / Coding CI）在 [`examples/ci/`](../../../examples/ci/README.zh-CN.md)。
 
 GitLab 更新评论时，先查最近更新的评论，找到第一个匹配的标记就停止翻页，让最初流水线发布、之后一直原地编辑的评论仍能被找到。若查完 20 页仍未找到且还有下一页，命令会报错，避免发出重复评论。
 

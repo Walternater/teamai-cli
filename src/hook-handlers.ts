@@ -150,14 +150,14 @@ const pullHandler: HookHandler = {
     // cut the push of a report pull() stopped waiting for. The host does not
     // wait for this pass, so waiting here does not delay the session.
     await settleLateUsageReport();
-    // Finished sessions are judged in a process this pass does not wait for, where a scope turns that on.
-    const { sessionScoringScopes } = await import('./score-sessions.js');
-    const scoringCwd = await pathExists(hintCwd) ? hintCwd : os.homedir();
-    const scoring = await sessionScoringScopes(scoringCwd).catch((e: unknown) => {
-      log.debug(`hook-dispatch: could not tell whether sessions are scored here: ${e instanceof Error ? e.message : String(e)}`);
+    // Finished attended sessions are judged or published in a process this pass does not wait for, where a scope turns that on.
+    const { backgroundPassScopes } = await import('./score-sessions.js');
+    const passCwd = await pathExists(hintCwd) ? hintCwd : os.homedir();
+    const scopes = await backgroundPassScopes(passCwd).catch((e: unknown) => {
+      log.debug(`hook-dispatch: could not tell whether sessions are scored or published here: ${e instanceof Error ? e.message : String(e)}`);
       return [];
     });
-    if (scoring.length > 0) await spawnDetachedScoreSessions(scoringCwd);
+    if (scopes.length > 0) await spawnDetachedScoreSessions(passCwd);
     return null;
   },
 };
@@ -404,9 +404,9 @@ async function isWithin(dir: string, parents: string[]): Promise<boolean> {
 
 const updateHandler: HookHandler = {
   name: 'update',
-  async execute(_stdin, _tool) {
+  async execute(_stdin, _tool, config) {
     const { doUpdate } = await import('./update.js');
-    await doUpdate();
+    await doUpdate(config);
     return null;
   },
 };
@@ -441,8 +441,10 @@ async function userModelAliases(stdin: Record<string, unknown>): Promise<Record<
   const eventName = typeof stdin.hook_event_name === 'string' ? stdin.hook_event_name.toLowerCase() : '';
   if (eventName !== 'stop') return undefined;
   try {
-    const { loadLocalConfig } = await import('./config.js');
-    return (await loadLocalConfig())?.modelAliases;
+    const { loadLocalConfig, loadMemberSettings } = await import('./config.js');
+    const local = await loadLocalConfig();
+    const settings = local?.scope === 'user' ? local : { ...(await loadMemberSettings()), ...local };
+    return settings.modelAliases;
   } catch {
     return undefined;
   }
@@ -453,7 +455,7 @@ const dashboardReportHandler: HookHandler = {
   async execute(stdin, tool, config) {
     // Registered with requiresConfig: a session outside any scope is not recorded.
     if (!config) return null;
-    const { parseHookEvent, appendEvent, compactEvents, dataHomeKey, eventProjectAnchor, addGitStateAtStart, gitStateIn } = await import('./dashboard-collector.js');
+    const { parseHookEvent, appendEvent, compactEvents, dataHomeKey, eventProjectAnchor, addGitStateAtStart, addGitHeadAtStop, gitStateIn } = await import('./dashboard-collector.js');
     const { getDataHome } = await import('./types.js');
     const raw = JSON.stringify(stdin);
     const event = await parseHookEvent(raw, tool, {
@@ -467,6 +469,7 @@ const dashboardReportHandler: HookHandler = {
       const [projectAnchor] = await Promise.all([
         eventProjectAnchor(event.cwd, event.sessionId),
         addGitStateAtStart(event, gitStateIn(stdin)),
+        addGitHeadAtStop(event),
       ]);
       event.projectAnchor = projectAnchor;
       // The foreground dispatcher's, so a background pass records what the session's own environment said.
@@ -828,17 +831,24 @@ const votesJudgeHandler: HookHandler = {
       // judge from ever running on the later turns that DO have recalls. So we
       // only spend the claim once there is real work to do.
       const { parseTranscriptForVotes } = await import('./transcript-parser.js');
-      // Codex, Muse and ZCode provide the reply directly. Their native session
-      // files are not Claude transcripts; use our settled recall log as evidence.
-      const { recalledDocsForSession } = await import('./recall-adoption.js');
-      const docs = finalReply ? await recalledDocsForSession(localConfig, dispatchSessionId) : [];
-      const voteData = finalReply ? {
-        finalAssistantText: finalReply,
-        recalledDocIds: docs.map(d => d.key),
-        recalledDocPaths: Object.fromEntries(docs.map(d => [d.key, d.path])),
-        recalledDocScopes: Object.fromEntries(docs.map(d => [d.key, d.scope])),
-      } : await parseTranscriptForVotes(transcriptPath!);
-      if (voteData.recalledDocIds.length === 0) return null;
+      // A Claude transcript stays the evidence whenever it shows a recall, even
+      // when the payload also carries the final reply (Claude Code sends both).
+      // Codex, Muse and ZCode send the reply, and their session files (Codex's
+      // rollout arrives as `transcript_path`) are not Claude transcripts, so
+      // with no recall found there, the settled recall log is the evidence.
+      const fromTranscript = transcriptPath ? await parseTranscriptForVotes(transcriptPath) : null;
+      let voteData = fromTranscript;
+      if (finalReply && !fromTranscript?.recalledDocIds.length) {
+        const { recalledDocsForSession } = await import('./recall-adoption.js');
+        const docs = await recalledDocsForSession(localConfig, dispatchSessionId);
+        voteData = {
+          finalAssistantText: finalReply,
+          recalledDocIds: docs.map(d => d.key),
+          recalledDocPaths: Object.fromEntries(docs.map(d => [d.key, d.path])),
+          recalledDocScopes: Object.fromEntries(docs.map(d => [d.key, d.scope])),
+        };
+      }
+      if (!voteData || voteData.recalledDocIds.length === 0) return null;
 
       // The session's upvote ledger holds every doc the hook path (or an earlier
       // judge pass) upvoted for it: those are not judged again (#884).
