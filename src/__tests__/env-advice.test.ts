@@ -17,25 +17,24 @@ describe('env value advice', () => {
     );
   });
 
-  it('names the environment, not the command, for a key the team does not declare', () => {
+  it('gives an undeclared added key a value with teamai env set', () => {
     const advice = envValueAdvice(['SIGNING_KEY'], new Set());
-    expect(advice).not.toContain('teamai env set');
     expect(advice).toBe(
-      'Set it in the environment, or declare it in the team repo (teamai env add SIGNING_KEY --secret)',
+      'Set it in the environment, or declare it in the team repo (teamai env add SIGNING_KEY --secret; give it a value with teamai env set SIGNING_KEY)',
     );
   });
 
   it('names the environment for several keys the team does not declare', () => {
     const advice = envValueAdvice(['FOO', 'BAR'], new Set());
     expect(advice).toBe(
-      'Set them in the environment, or declare them in the team repo (teamai env add FOO --secret, teamai env add BAR --secret)',
+      'Set them in the environment, or declare FOO, BAR in the team repo (teamai env add FOO --secret, teamai env add BAR --secret; give them values with teamai env set FOO, teamai env set BAR)',
     );
   });
 
   it('names the command for the key the team declares and the environment for the one it does not', () => {
     const advice = envValueAdvice(['FOO', 'BAR'], new Set(['FOO']));
     expect(advice).toBe(
-      'Run teamai env set FOO, or set BAR in the environment, or declare BAR in the team repo (teamai env add BAR --secret)',
+      'Run teamai env set FOO, or set FOO in the environment, and set BAR in the environment, or declare BAR in the team repo (teamai env add BAR --secret; give it a value with teamai env set BAR)',
     );
   });
 });
@@ -59,17 +58,17 @@ describe('the missing_env failure', () => {
     present: new Set(),
   });
 
-  it('tells the member to set a key the team does not declare in the environment, and names no command that fails', () => {
+  it('tells the member to set a key the team does not declare in the environment, or add then set it', () => {
     const result = negotiate(offer, can, allow, facts([]));
     expect(result).toMatchObject({
       kind: 'fail',
       failure: {
         code: 'missing_env',
         message: 'Step "sign" requires env SIGNING_KEY, which has no value on this machine. '
-          + 'Set it in the environment, or declare it in the team repo (teamai env add SIGNING_KEY --secret), then retry the step.',
+          + 'Set it in the environment, or declare it in the team repo (teamai env add SIGNING_KEY --secret; give it a value with teamai env set SIGNING_KEY), then retry the step.',
       },
     });
-    expect(result.kind === 'fail' && result.failure.message).not.toContain('teamai env set SIGNING_KEY');
+    expect(result.kind === 'fail' && result.failure.message).toContain('teamai env set SIGNING_KEY');
   });
 
   it('names the command for a key the team declares', () => {

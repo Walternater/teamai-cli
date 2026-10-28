@@ -11,9 +11,11 @@
 import { sameEnvName } from './resources/env-key.js';
 
 /**
- * How to give each of `keys` a value here, as one clause: `teamai env set KEY`
- * for a key the team declares, and the environment for a key it does not, with
- * the team repo named as where such a key is declared.
+ * How to give each of `keys` a value here. Each key needs a value, so groups
+ * of declared and undeclared keys are joined with "and"; the alternatives
+ * live inside one group. `teamai env set KEY` is for a key the team declares,
+ * and the environment for a key it does not. An added key still needs its
+ * value with `teamai env set KEY`.
  *
  * `declared` is the keys the team declares here, as `EnvFacts` holds them.
  */
@@ -22,15 +24,18 @@ export function envValueAdvice(keys: readonly string[], declared: ReadonlySet<st
   const unknown: string[] = [];
   for (const key of keys) (sameEnvName(declared, key) === undefined ? unknown : known).push(key);
   const one = keys.length === 1;
-  const pronoun = one ? 'it' : 'them';
   const sets = known.map((key) => `teamai env set ${key}`).join(', ');
   const adds = unknown.map((key) => `teamai env add ${key} --secret`).join(', ');
+  const valueSets = unknown.map((key) => `teamai env set ${key}`).join(', ');
+  const values = unknown.length === 1
+    ? `give it a value with ${valueSets}`
+    : `give them values with ${valueSets}`;
+  const declare = `declare ${one ? 'it' : unknown.join(', ')} in the team repo (${adds}; ${values})`;
   if (unknown.length === 0) {
-    return `Run ${sets}, or set ${pronoun} in the environment`;
+    return `Run ${sets}, or set ${one ? 'it' : 'them'} in the environment`;
   }
   if (known.length === 0) {
-    return `Set ${pronoun} in the environment, or declare ${pronoun} in the team repo (${adds})`;
+    return `Set ${one ? 'it' : 'them'} in the environment, or ${declare}`;
   }
-  return `Run ${sets}, or set ${unknown.join(', ')} in the environment, `
-    + `or declare ${unknown.join(', ')} in the team repo (${adds})`;
+  return `Run ${sets}, or set ${known.join(', ')} in the environment, and set ${unknown.join(', ')} in the environment, or ${declare}`;
 }
