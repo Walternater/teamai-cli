@@ -283,7 +283,7 @@ describe('teamai remove exits 1 when nothing was removed', () => {
   });
 
   // Two removals in one second generate one name, and the first leaves its branch behind, so the second's
-  // checkout fails with "a branch named ... already exists" unless the name is one nothing has yet (#1740 follow-up).
+  // checkout fails with "a branch named ... already exists" unless the name is one nothing has yet (#1758).
   it('pushes onto the free branch name, not the one a removal in the same second already took', async () => {
     gitMocks.unusedBranchName.mockResolvedValueOnce('teamai/push/alice/1-2');
 
